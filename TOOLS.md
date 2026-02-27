@@ -56,3 +56,5 @@ Delivery rule:
 
 - For long outputs, send concise summary plus path/log reference, not raw dumps.
 
+
+- Auto-commit helper: bash /home/felixlee/Desktop/aibot/scripts/self_improve_autocommit.sh pi-source-sync <reason>

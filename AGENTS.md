@@ -220,6 +220,7 @@ When running autonomous maintenance or self-improvement tasks:
 - Never modify OpenClaw runtime state directly under /home/felixlee/.openclaw/ unless explicitly asked.
 - Prefer minimal patches. Avoid broad refactors during unattended runs.
 - Always run bash /home/felixlee/Desktop/aibot/scripts/self_improve_check.sh after changes.
+- For any self-improve code/doc change, run bash /home/felixlee/Desktop/aibot/scripts/self_improve_autocommit.sh pi-source-sync self-improve before final response.
 - If checks fail, do not claim success. Report failure summary and stop.
 - Do not execute destructive commands (rm -rf, git reset --hard, mass deletes).
 - External/system changes (apt installs, systemd changes, firewall/network changes) require explicit human approval.
