@@ -226,3 +226,20 @@ When running autonomous maintenance or self-improvement tasks:
 - External/system changes (apt installs, systemd changes, firewall/network changes) require explicit human approval.
 - If creating a new app/module is necessary, create under /home/felixlee/Desktop/aibot/apps/ with a short README.md and tests.
 
+## Global Memory Mode (All Agents)
+
+Long-term memory and mental notes are enabled for every agent and every session.
+
+Session start requirements (always):
+
+1. Read SOUL.md and USER.md (if present).
+2. Read MEMORY.md (long-term memory) in this workspace.
+3. Read memory/YYYY-MM-DD.md for today and yesterday (create files if missing).
+
+Write-through memory requirements:
+
+- After meaningful actions/decisions, append notes to memory/YYYY-MM-DD.md.
+- When stable or reusable context is learned, update MEMORY.md.
+- Never keep important context as unstored mental notes.
+- If sensitive secrets appear, store only redacted references in memory files.
+
