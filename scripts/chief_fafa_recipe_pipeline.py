@@ -223,12 +223,33 @@ def read_env_value(name: str, default: str = "") -> str:
     return default
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = read_env_value(name, "1" if default else "0").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def is_fast_mode_enabled() -> bool:
+    return env_flag("CHIEF_FAFA_FAST_MODE", False)
+
+
 def normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
 def decode_html_text(text: str) -> str:
     return normalize_space(unescape(text or ""))
+
+
+def normalize_multiline_text(text: str) -> str:
+    raw = unescape(text or "")
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [normalize_space(x) for x in raw.split("\n")]
+    kept = [x for x in lines if x]
+    return "\n".join(kept).strip()
 
 
 def unique_clean_lines(items: Iterable[str], max_items: int = 220) -> List[str]:
@@ -300,6 +321,42 @@ def is_heading_line(line: str, keywords: List[str]) -> bool:
     return any(k in low for k in keywords)
 
 
+def heading_keywords_pattern(keywords: List[str]) -> str:
+    ordered = sorted({k for k in keywords if k}, key=len, reverse=True)
+    if not ordered:
+        return r"(?:)"
+    return "(?:" + "|".join(re.escape(k) for k in ordered) + ")"
+
+
+def is_heading_start_line(line: str, keywords: List[str]) -> bool:
+    patt = heading_keywords_pattern(keywords)
+    return bool(
+        re.search(
+            rf"^\s*(?:[-*•●▪■★☆※]\s*)?{patt}(?:\s*[\(\[（【].{{0,40}}?[\)\]）】])?\s*(?:[:：]|$)",
+            line,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def heading_inline_tail(line: str, keywords: List[str]) -> str:
+    patt = heading_keywords_pattern(keywords)
+    m = re.search(
+        rf"^\s*(?:[-*•●▪■★☆※]\s*)?{patt}(?:\s*[\(\[（【].{{0,40}}?[\)\]）】])?\s*(?:[:：]|[-—–])?\s*(.*)$",
+        line,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return ""
+    tail = normalize_space(m.group(1) or "")
+    if not tail:
+        return ""
+    # Treat pure heading aliases as empty tails.
+    if re.fullmatch(r"[\(\[（【].{0,40}[\)\]）】]", tail):
+        return ""
+    return tail
+
+
 def looks_like_ingredient_line(line: str) -> bool:
     low = line.casefold()
     if any(k in low for k in INGREDIENT_HEADING_KEYWORDS):
@@ -330,14 +387,17 @@ def extract_sections_from_lines(lines: List[str]) -> Tuple[List[str], List[str]]
     i = 0
     while i < len(lines):
         line = lines[i]
-        if is_heading_line(line, INGREDIENT_HEADING_KEYWORDS):
+        if is_heading_start_line(line, INGREDIENT_HEADING_KEYWORDS):
             j = i + 1
             block: List[str] = []
+            inline_tail = heading_inline_tail(line, INGREDIENT_HEADING_KEYWORDS)
+            if inline_tail:
+                block.extend(split_ingredient_candidates(inline_tail))
             while j < len(lines):
                 cur = lines[j]
-                if is_heading_line(cur, METHOD_HEADING_KEYWORDS) or is_heading_line(cur, STOP_SECTION_KEYWORDS):
+                if is_heading_start_line(cur, METHOD_HEADING_KEYWORDS) or is_heading_start_line(cur, STOP_SECTION_KEYWORDS):
                     break
-                if is_heading_line(cur, INGREDIENT_HEADING_KEYWORDS):
+                if is_heading_start_line(cur, INGREDIENT_HEADING_KEYWORDS):
                     j += 1
                     continue
                 if looks_like_ingredient_line(cur):
@@ -349,14 +409,17 @@ def extract_sections_from_lines(lines: List[str]) -> Tuple[List[str], List[str]]
             i = j
             continue
 
-        if is_heading_line(line, METHOD_HEADING_KEYWORDS):
+        if is_heading_start_line(line, METHOD_HEADING_KEYWORDS):
             j = i + 1
             block = []
+            inline_tail = heading_inline_tail(line, METHOD_HEADING_KEYWORDS)
+            if inline_tail:
+                block.extend(split_step_candidates(inline_tail))
             while j < len(lines):
                 cur = lines[j]
-                if is_heading_line(cur, INGREDIENT_HEADING_KEYWORDS) or is_heading_line(cur, STOP_SECTION_KEYWORDS):
+                if is_heading_start_line(cur, INGREDIENT_HEADING_KEYWORDS) or is_heading_start_line(cur, STOP_SECTION_KEYWORDS):
                     break
-                if is_heading_line(cur, METHOD_HEADING_KEYWORDS):
+                if is_heading_start_line(cur, METHOD_HEADING_KEYWORDS):
                     j += 1
                     continue
                 if looks_like_step_line(cur):
@@ -377,8 +440,12 @@ def extract_sections_by_regex(text_blob: str) -> Tuple[List[str], List[str]]:
     ingredients: List[str] = []
     steps: List[str] = []
 
+    ing_kw = heading_keywords_pattern(INGREDIENT_HEADING_KEYWORDS)
+    method_kw = heading_keywords_pattern(METHOD_HEADING_KEYWORDS)
+    stop_kw = heading_keywords_pattern(STOP_SECTION_KEYWORDS)
+
     ingredient_match = re.search(
-        r"(?:ingredients?|材料|食材|配料)\s*[:：]\s*(.+?)(?:(?:method|instructions?|directions?|steps?|做法|作法|步驟|步骤)\s*[:：]|$)",
+        rf"(?:{ing_kw})(?:\s*[\(\[（【].{{0,40}}?[\)\]）】])?\s*[:：]\s*(.+?)(?:(?:{method_kw})(?:\s*[\(\[（【].{{0,40}}?[\)\]）】])?\s*[:：]|$)",
         low_blob,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -389,7 +456,7 @@ def extract_sections_by_regex(text_blob: str) -> Tuple[List[str], List[str]]:
                 ingredients.append(part)
 
     method_match = re.search(
-        r"(?:method|instructions?|directions?|steps?|做法|作法|步驟|步骤)\s*[:：]\s*(.+)",
+        rf"(?:{method_kw})(?:\s*[\(\[（【].{{0,40}}?[\)\]）】])?\s*[:：]\s*(.+)",
         low_blob,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -397,7 +464,7 @@ def extract_sections_by_regex(text_blob: str) -> Tuple[List[str], List[str]]:
         block = method_match.group(1)
         # stop at common terminal sections if present
         stop = re.split(
-            r"(?:\n\s*(?:notes?|tips?|nutrition|影片|视频|備註|备注|心得)\s*[:：])",
+            rf"(?:\n\s*(?:{stop_kw})(?:\s*[\(\[（【].{{0,40}}?[\)\]）】])?\s*[:：])",
             block,
             maxsplit=1,
             flags=re.IGNORECASE,
@@ -419,7 +486,14 @@ def extract_recipe_sections_from_text_blob(text_blob: str) -> Tuple[List[str], L
     steps = unique_clean_lines(section_steps + regex_steps, max_items=320)
 
     if not steps and lines:
-        synthetic_steps = [x for x in lines if looks_like_step_line(x)]
+        synthetic_steps = [
+            x
+            for x in lines
+            if looks_like_step_line(x)
+            and len(x) <= 280
+            and not is_heading_start_line(x, INGREDIENT_HEADING_KEYWORDS)
+            and not is_heading_start_line(x, STOP_SECTION_KEYWORDS)
+        ]
         steps = unique_clean_lines(synthetic_steps, max_items=80)
     return ingredients, steps
 
@@ -456,14 +530,14 @@ def thumbnail_from_video_metadata(meta: Dict[str, Any]) -> str:
 
 
 def extract_video_text_sources(final_url: str, initial_description: str) -> Dict[str, str]:
-    out: Dict[str, str] = {"description": decode_html_text(initial_description), "transcript": "", "error": ""}
+    out: Dict[str, str] = {"description": normalize_multiline_text(initial_description), "transcript": "", "error": ""}
     meta, meta_err = fetch_video_metadata_with_ytdlp(final_url)
     if meta_err:
         if not has_meaningful_text(out.get("description", ""), min_chars=24):
             out["error"] = meta_err
         return out
 
-    meta_description = decode_html_text(str(meta.get("description", "")))
+    meta_description = normalize_multiline_text(str(meta.get("description", "")))
     if has_meaningful_text(meta_description, min_chars=20):
         out["description"] = meta_description
 
@@ -478,7 +552,9 @@ def extract_video_text_sources(final_url: str, initial_description: str) -> Dict
         transcript_text, transcript_err = fetch_caption_text(subtitle_url)
 
     need_transcription = (not transcript_text) and (not has_meaningful_text(out.get("description", ""), min_chars=24))
-    if need_transcription:
+    if need_transcription and is_fast_mode_enabled():
+        transcript_err = "fast mode skipped audio transcription"
+    elif need_transcription:
         audio_path, audio_err = download_video_audio_with_ytdlp(final_url)
         if audio_path:
             transcript_text, transcript_err = transcribe_audio_with_openai(audio_path)
@@ -725,6 +801,79 @@ def strip_diagnostic_suffix(text: str) -> str:
     return normalize_space(cleaned)
 
 
+def is_noise_or_error_line(text: str) -> bool:
+    low = decode_html_text(text).casefold()
+    if not low:
+        return True
+
+    noise_markers = [
+        "window.wiz_global_data",
+        "window.ytcfg",
+        "__next_data__",
+        "ytcfg.set(",
+        "function(",
+        "<!doctype html",
+        "<html",
+        "</script",
+        "javascript:",
+        "source map",
+    ]
+    error_markers = [
+        "traceback",
+        "exception",
+        "error:",
+        "openai call failed",
+        "httpsconnectionpool",
+        "readtimeout",
+        "command still running",
+        "no session found",
+        "allocation failed",
+        "fatal error",
+    ]
+    if any(marker in low for marker in noise_markers):
+        return True
+    if any(marker in low for marker in error_markers):
+        return True
+    if low.startswith(("window.", "var ", "const ", "let ")):
+        return True
+
+    # Drop script-like long blobs that are unlikely to be recipe content.
+    punct = sum(1 for ch in low if ch in "{}[]<>;=|\\")
+    if len(low) >= 120 and punct >= 8:
+        return True
+    return False
+
+
+def sanitize_doc_text_block(text: str, max_chars: int) -> str:
+    raw = unescape(str(text or "")).replace("\r\n", "\n").replace("\r", "\n")
+    kept: List[str] = []
+    for line in raw.split("\n"):
+        clean = decode_html_text(line)
+        if not clean:
+            continue
+        if is_noise_or_error_line(clean):
+            continue
+        kept.append(clean)
+    if not kept:
+        return ""
+    cleaned = "\n".join(kept)
+    cleaned = strip_diagnostic_suffix(cleaned)
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[: max_chars - 3].rstrip() + "..."
+    return cleaned
+
+
+def sanitize_recipe_lines_for_doc(lines: List[str], max_items: int) -> List[str]:
+    out: List[str] = []
+    for line in unique_clean_lines(lines, max_items=max_items * 2):
+        if is_noise_or_error_line(line):
+            continue
+        out.append(line)
+        if len(out) >= max_items:
+            break
+    return out
+
+
 def is_detailed_video_description(text: str) -> bool:
     clean = decode_html_text(text)
     if len(clean) >= 280:
@@ -861,6 +1010,17 @@ def human_readable_doc_summary(source: Dict[str, Any], formats: Dict[str, str]) 
     if len(preferred) > 600:
         preferred = preferred[:597].rstrip() + "..."
     return preferred
+
+
+def build_reply_message(summary: str, google_doc_status: str, google_doc_url: str, error_message: str) -> str:
+    lines: List[str] = []
+    lines.append(f"Summary: {normalize_space(summary)}")
+    lines.append(f"Google Doc status: {normalize_space(google_doc_status)}")
+    lines.append(f"Google Doc URL: {normalize_space(google_doc_url)}")
+    clean_error = normalize_space(error_message)
+    if clean_error:
+        lines.append(f"Error: {clean_error}")
+    return "\n".join(lines)
 
 
 def first_non_empty(values: Iterable[Optional[str]]) -> str:
@@ -1961,6 +2121,62 @@ def extract_video_from_json_ld(video_obj: Dict[str, Any], base_url: str) -> Dict
     }
 
 
+def decode_js_escaped_text(value: str) -> str:
+    if not value:
+        return ""
+    text = str(value)
+
+    def _u4(match: re.Match[str]) -> str:
+        try:
+            return chr(int(match.group(1), 16))
+        except Exception:
+            return ""
+
+    # Decode common JavaScript escapes found in embedded JSON blobs.
+    text = re.sub(r"\\u([0-9a-fA-F]{4})", _u4, text)
+    text = text.replace("\\n", "\n").replace("\\r", "\n").replace("\\t", " ")
+    text = text.replace('\\"', '"').replace("\\/", "/").replace("\\\\", "\\")
+    return normalize_multiline_text(text)
+
+
+def extract_youtube_fast_fields_from_html(html: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not html:
+        return out
+
+    title_match = re.search(
+        r'"videoDetails":\{.*?"title":"((?:[^"\\]|\\.)+)"',
+        html,
+        flags=re.DOTALL,
+    )
+    if title_match:
+        title = cleanup_title_text(decode_js_escaped_text(title_match.group(1)))
+        if title:
+            out["title"] = title
+
+    desc_match = re.search(
+        r'"shortDescription":"((?:[^"\\]|\\.)*)","isCrawlable"',
+        html,
+        flags=re.DOTALL,
+    )
+    if not desc_match:
+        desc_match = re.search(
+            r'"shortDescription":"((?:[^"\\]|\\.)*)","thumbnail"',
+            html,
+            flags=re.DOTALL,
+        )
+    if desc_match:
+        desc = decode_js_escaped_text(desc_match.group(1))
+        if has_meaningful_text(desc, min_chars=20):
+            out["description"] = desc
+
+    thumb_match = re.search(r'"thumbnailUrl":"(https:[^"]+)"', html)
+    if thumb_match:
+        out["thumbnail_url"] = decode_html_text(thumb_match.group(1).replace("\\/", "/"))
+
+    return out
+
+
 def find_ytdlp_binary() -> str:
     detected = shutil.which("yt-dlp")
     if detected:
@@ -2053,6 +2269,8 @@ def parse_caption_text(raw: str) -> str:
         cur = re.sub(r"<[^>]+>", " ", cur)
         cur = decode_html_text(cur)
         if not cur:
+            continue
+        if is_noise_or_error_line(cur):
             continue
         if cur == prev:
             continue
@@ -2447,6 +2665,8 @@ def should_skip_openai_generation(payload: Dict[str, Any]) -> bool:
 
 
 def build_formats_with_openai(payload: Dict[str, Any]) -> Tuple[Dict[str, str], str]:
+    if is_fast_mode_enabled():
+        return {}, "OpenAI skipped (fast mode)"
     if should_skip_openai_generation(payload):
         return {}, "OpenAI skipped (video source already has rich structured content)"
     system_prompt = (
@@ -2996,6 +3216,7 @@ def insert_text_into_doc(
 
 
 def create_google_doc_note(title: str, body: str, image_url: str = "") -> Dict[str, Any]:
+    fast_mode = is_fast_mode_enabled()
     token, err = resolve_docs_access_token()
     if not token:
         return {"ok": False, "message": err or "missing Google Docs token"}
@@ -3069,7 +3290,53 @@ def create_google_doc_note(title: str, body: str, image_url: str = "") -> Dict[s
         marker=DOC_IMAGE_MARKER,
     )
 
-    if image_url:
+    if image_url and fast_mode:
+        # Fast mode: avoid Drive upload roundtrips and try direct-source embed first.
+        target_index: Optional[int]
+        if marker_start > 0 and marker_end > marker_start:
+            delete_err = delete_text_range_in_doc(
+                document_id=document_id,
+                access_token=token,
+                quota_project=quota_project,
+                start_index=marker_start,
+                end_index=marker_end,
+            )
+            if delete_err:
+                return {
+                    "ok": False,
+                    "message": f"created, but image marker cleanup failed: {delete_err}",
+                    "document_id": document_id,
+                    "url": doc_url,
+                }
+            target_index = marker_start
+        else:
+            target_index = None
+
+        insert_err = ""
+        for uri_candidate in candidate_image_urls_for_embed(image_url):
+            insert_err = insert_image_into_doc(
+                document_id=document_id,
+                access_token=token,
+                quota_project=quota_project,
+                image_uri=uri_candidate,
+                insert_index=target_index,
+            )
+            if not insert_err:
+                break
+
+        if insert_err:
+            if marker_start > 0 and marker_end > marker_start:
+                insert_text_into_doc(
+                    document_id=document_id,
+                    access_token=token,
+                    quota_project=quota_project,
+                    index=marker_start,
+                    text="(image unavailable)\n",
+                )
+            image_embed_note = f" (fast mode: image unavailable - {insert_err})"
+        else:
+            image_embed_note = " (image embedded, fast mode)"
+    elif image_url:
         image_bytes, mime_type, filename, download_err = download_image_for_embed(image_url)
         if download_err:
             if marker_start > 0 and marker_end > marker_start:
@@ -3197,14 +3464,10 @@ def build_google_doc_recipe_text(source: Dict[str, Any], summary_text: str) -> s
     is_video = str(source.get("content_type", "")).strip().lower() == "video"
     is_text_recipe = str(source.get("content_type", "")).strip().lower() == "text_recipe_input"
     input_language = decode_html_text(str(source.get("input_language", ""))).strip()
-    ingredients = unique_clean_lines([str(x) for x in source.get("ingredients", [])], max_items=320)
-    steps = unique_clean_lines([str(x) for x in source.get("instructions", [])], max_items=360)
-    video_description = decode_html_text(str(source.get("video_description", "")))
-    video_transcript = decode_html_text(str(source.get("video_transcript", "")))
-    if len(video_description) > 2400:
-        video_description = video_description[:2397].rstrip() + "..."
-    if len(video_transcript) > 7000:
-        video_transcript = video_transcript[:6997].rstrip() + "..."
+    ingredients = sanitize_recipe_lines_for_doc([str(x) for x in source.get("ingredients", [])], max_items=320)
+    steps = sanitize_recipe_lines_for_doc([str(x) for x in source.get("instructions", [])], max_items=360)
+    video_description = sanitize_doc_text_block(str(source.get("video_description", "")), max_chars=2400)
+    video_transcript = sanitize_doc_text_block(str(source.get("video_transcript", "")), max_chars=7000)
 
     if not summary_text:
         summary_text = decode_html_text(str(source.get("description", "")))
@@ -3345,6 +3608,8 @@ def format_duplicate_markdown_report(hit: Dict[str, Any]) -> str:
 
 def extract_source_payload(url: str) -> Dict[str, Any]:
     final_url, html = fetch_page(url)
+    domain = urlparse(final_url).netloc.lower()
+    is_youtube_source = ("youtube.com" in domain) or ("youtu.be" in domain)
     title = extract_title(html)
     description = extract_description(html)
     image_url = extract_image_url(html, final_url)
@@ -3373,23 +3638,46 @@ def extract_source_payload(url: str) -> Dict[str, Any]:
     video_transcript = ""
     video_note = ""
     if is_video_source:
-        enriched = extract_video_text_sources(final_url, video_description)
-        video_description = first_non_empty([enriched.get("description", ""), video_description])
-        video_transcript = decode_html_text(str(enriched.get("transcript", "")))
-        video_note = decode_html_text(str(enriched.get("error", "")))
-        title = first_non_empty([enriched.get("title", ""), video_fields.get("name"), title, urlparse(final_url).netloc])
-        image_url = first_non_empty(
-            [
-                enriched.get("thumbnail_url", ""),
-                video_fields.get("thumbnail_url"),
-                recipe_fields.get("image_url"),
-                image_url,
-            ]
-        )
+        fast_mode = is_fast_mode_enabled()
+        if fast_mode and is_youtube_source:
+            youtube_fast = extract_youtube_fast_fields_from_html(html)
+            video_description = first_non_empty([youtube_fast.get("description", ""), video_description])
+            title = first_non_empty([youtube_fast.get("title", ""), video_fields.get("name"), title, urlparse(final_url).netloc])
+            image_url = first_non_empty(
+                [
+                    youtube_fast.get("thumbnail_url", ""),
+                    video_fields.get("thumbnail_url"),
+                    recipe_fields.get("image_url"),
+                    image_url,
+                ]
+            )
+
+        need_enrichment = not (fast_mode and is_youtube_source and has_meaningful_text(video_description, min_chars=40))
+        if need_enrichment:
+            enriched = extract_video_text_sources(final_url, video_description)
+            video_description = first_non_empty([enriched.get("description", ""), video_description])
+            video_transcript = normalize_multiline_text(str(enriched.get("transcript", "")))
+            video_note = decode_html_text(str(enriched.get("error", "")))
+            title = first_non_empty([enriched.get("title", ""), video_fields.get("name"), title, urlparse(final_url).netloc])
+            image_url = first_non_empty(
+                [
+                    enriched.get("thumbnail_url", ""),
+                    video_fields.get("thumbnail_url"),
+                    recipe_fields.get("image_url"),
+                    image_url,
+                ]
+            )
+        # Prefer extraction from description; only use transcript as fallback when missing.
+        desc_ingredients, desc_steps = extract_recipe_sections_from_text_blob(video_description)
+        all_ingredients = unique_clean_lines(list(all_ingredients) + desc_ingredients, max_items=260)
+        all_steps = unique_clean_lines(list(all_steps) + desc_steps, max_items=320)
+        if (not all_ingredients or not all_steps) and video_transcript:
+            transcript_ingredients, transcript_steps = extract_recipe_sections_from_text_blob(video_transcript)
+            if not all_ingredients:
+                all_ingredients = unique_clean_lines(list(all_ingredients) + transcript_ingredients, max_items=260)
+            if not all_steps:
+                all_steps = unique_clean_lines(list(all_steps) + transcript_steps, max_items=320)
         video_blob = "\n\n".join([video_description, video_transcript]).strip()
-        video_ingredients, video_steps = extract_recipe_sections_from_text_blob(video_blob)
-        all_ingredients = unique_clean_lines(list(all_ingredients) + video_ingredients, max_items=260)
-        all_steps = unique_clean_lines(list(all_steps) + video_steps, max_items=320)
         if not text_excerpt and video_blob:
             text_excerpt = video_blob[:2400]
     else:
@@ -3401,12 +3689,11 @@ def extract_source_payload(url: str) -> Dict[str, Any]:
         description = first_non_empty([recipe_fields.get("description"), description, text_excerpt[:280]])
     title = first_non_empty([recipe_fields.get("name"), title, urlparse(final_url).netloc])
 
-    domain = urlparse(final_url).netloc.lower()
     title = decode_html_text(title)
     description = decode_html_text(description)
     image_url = decode_html_text(image_url)
-    video_description = decode_html_text(video_description) if is_video_source else ""
-    video_transcript = decode_html_text(video_transcript) if is_video_source else ""
+    video_description = normalize_multiline_text(video_description) if is_video_source else ""
+    video_transcript = normalize_multiline_text(video_transcript) if is_video_source else ""
 
     context_text = "\n".join([video_description, video_transcript[:800], description, text_excerpt[:500]])
     title = refine_title_for_content_language(title, context_text)
@@ -3515,12 +3802,22 @@ def main() -> None:
         }
         if args.json:
             if args.json_brief:
+                summary = str(lookup.get("summary", "")).strip()
+                google_doc_status = str(lookup.get("google_doc_status", "not_found")).strip()
+                google_doc_url = str(lookup.get("google_doc_url", "")).strip()
+                error_message = str(lookup.get("error_message", "")).strip()
                 brief = {
                     "ok": bool(lookup_result.get("ok")),
-                    "summary": str(lookup.get("summary", "")).strip(),
-                    "google_doc_status": str(lookup.get("google_doc_status", "not_found")).strip(),
-                    "google_doc_url": str(lookup.get("google_doc_url", "")).strip(),
-                    "error_message": str(lookup.get("error_message", "")).strip(),
+                    "summary": summary,
+                    "google_doc_status": google_doc_status,
+                    "google_doc_url": google_doc_url,
+                    "error_message": error_message,
+                    "reply_message": build_reply_message(
+                        summary=summary,
+                        google_doc_status=google_doc_status,
+                        google_doc_url=google_doc_url,
+                        error_message=error_message,
+                    ),
                     "lookup": lookup,
                     "auto_review_triggers": auto_review_triggers,
                     "report_path": str(report_path),
@@ -3552,6 +3849,12 @@ def main() -> None:
                 "google_doc_status": "exists",
                 "google_doc_url": str(initial_dup.get("doc_url", "")).strip(),
                 "error_message": "",
+                "reply_message": build_reply_message(
+                    summary=duplicate_summary[:220],
+                    google_doc_status="exists",
+                    google_doc_url=str(initial_dup.get("doc_url", "")).strip(),
+                    error_message="",
+                ),
                 "doc": {
                     "ok": True,
                     "url": str(initial_dup.get("doc_url", "")).strip(),
@@ -3766,6 +4069,12 @@ def main() -> None:
                 "google_doc_status": doc_status,
                 "google_doc_url": doc_url,
                 "error_message": error_message,
+                "reply_message": build_reply_message(
+                    summary=summary,
+                    google_doc_status=doc_status,
+                    google_doc_url=doc_url,
+                    error_message=error_message,
+                ),
                 "doc": note_result,
                 "duplicate": duplicate_hit_post_fetch if duplicate_hit_post_fetch else {},
                 "auto_review_triggers": auto_review_triggers,

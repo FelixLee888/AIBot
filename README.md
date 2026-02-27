@@ -1,29 +1,30 @@
-# AIBot
+# Chief Fafa Bot
 
-Automation scripts for two assistant workflows:
+Chief Fafa is a Telegram/OpenClaw recipe agent that accepts URL or text input, extracts recipe data, and creates a Google Doc note.
 
-- **Yuen Yuen Weather Agent**: Scotland mountain forecast + source benchmarking + Telegram delivery.
-- **Chief Fafa Bot**: recipe/video URL ingestion + content pack generation + Google Docs note creation.
+## Features
+
+- URL intake for recipe pages and video/social links
+- Full-text recipe intake (multi-language)
+- Saved recipe enquiry (memory + local notes + conversation history + Google Docs)
+- Duplicate URL detection before creating a new document
+- Google Docs generation with structured recipe format and image embedding (best-effort)
+- Stable chat payload via `--json --json-brief` including `reply_message` for direct Telegram reply
 
 ## Repository Layout
 
 ```text
 scripts/
-  weather_mountains_briefing.py     # Forecast + benchmark engine
-  send_weather_telegram.py          # Chunked Telegram sender for weather output
-  chief_fafa_recipe_pipeline.py     # Recipe/video extraction + content formats + Google Doc
-  google_keep_oauth_setup.py        # OAuth helper for Google Docs/Keep tokens
+  chief_fafa_recipe_pipeline.py   # Core extraction + formatting + Google Docs write
+  chief_fafa_auto_review.py       # Auto-review helper (best-effort)
+  google_keep_oauth_setup.py      # OAuth helper for Google credentials bootstrap
 ```
 
 ## Prerequisites
 
 - Python 3.10+
-- `requests` Python package
-- Optional:
-  - `yt-dlp` for richer video metadata/transcript extraction in Chief Fafa
-  - `eccodes` Python package for Met Office atmospheric GRIB extraction
-
-Install minimum dependency:
+- `requests`
+- Optional: `yt-dlp` for richer video metadata/captions
 
 ```bash
 python3 -m pip install --upgrade requests
@@ -31,136 +32,84 @@ python3 -m pip install --upgrade requests
 
 ## Environment Variables
 
-Create a local `.env` (or use `~/.openclaw/.env` for OpenClaw runtime).  
-Do **not** commit secrets.
+Set in `.env` or `~/.openclaw/.env` (do not commit secrets).
 
-### Weather Agent
-
-- `TELEGRAM_BOT_TOKEN` (required for Telegram send)
-- `WEATHER_TELEGRAM_CHAT_ID` (optional; default currently `6683969437`)
-- `WEATHER_BENCHMARK_DATA_DIR` (optional; default auto-resolved)
-- `METOFFICE_API_KEY` (optional)
-- `METOFFICE_ATMOS_API_KEY` (optional)
-- `METOFFICE_ATMOS_ORDER_ID` (optional)
-- `OPENWEATHER_API_KEY` (optional)
-- `GOOGLE_WEATHER_ACCESS_TOKEN` (recommended for Google Weather)
-- `GOOGLE_WEATHER_API_KEY` (fallback for Google Weather)
-- `GOOGLE_WEATHER_QUOTA_PROJECT` / `GOOGLE_CLOUD_PROJECT` (for Google billing header)
-
-### Chief Fafa (Google Docs)
+Required for normal operation:
 
 - `OPENAI_API_KEY`
 - `GOOGLE_DOCS_CLIENT_ID`
 - `GOOGLE_DOCS_CLIENT_SECRET`
 - `GOOGLE_DOCS_REFRESH_TOKEN`
-- `GOOGLE_DOCS_ACCESS_TOKEN` (optional; refresh token flow preferred)
-- `GOOGLE_DOCS_REDIRECT_URI` (optional; default `http://127.0.0.1:8788/callback`)
-- `CHIEF_FAFA_OUTPUT_DIR` (optional; default `/home/felixlee/Desktop/chief-fafa/notes`)
-- `CHIEF_FAFA_OPENAI_TIMEOUT_SEC` (optional; timeout tuning)
-- `CHIEF_FAFA_MEMORY_ROOT` (optional; default `/home/felixlee/Desktop/chief-fafa`)
-- `CHIEF_FAFA_OPENCLAW_SESSIONS_DIR` (optional; default `/home/felixlee/.openclaw/agents/chief-fafa/sessions`)
-- `CHIEF_FAFA_AUTO_REVIEW_ENABLED` (optional; default `1`)
-- `CHIEF_FAFA_AUTO_REVIEW_SCRIPT` (optional; default `/home/felixlee/Desktop/chief-fafa/scripts/chief_fafa_auto_review.py`)
-- `CHIEF_FAFA_SEEN_HOSTS_FILE` (optional; default `/home/felixlee/Desktop/chief-fafa/.pi/seen_url_hosts.json`)
 
-## Yuen Yuen Weather Agent
+Common optional settings:
 
-### 1) Generate briefing locally
+- `GOOGLE_DOCS_ACCESS_TOKEN` (fallback only; refresh token preferred)
+- `GOOGLE_DOCS_REDIRECT_URI` (default `http://127.0.0.1:8788/callback`)
+- `GOOGLE_DOCS_QUOTA_PROJECT` (recommended for Google billing headers)
+- `CHIEF_FAFA_OUTPUT_DIR` (default `/home/felixlee/Desktop/chief-fafa/notes`)
+- `CHIEF_FAFA_FAST_MODE` (`1` to reduce heavy enrichment for faster Telegram replies)
+- `CHIEF_FAFA_OPENAI_TIMEOUT_SEC` (timeout tuning)
+- `CHIEF_FAFA_MEMORY_ROOT` (memory root override)
+- `CHIEF_FAFA_OPENCLAW_SESSIONS_DIR` (OpenClaw sessions path override)
+- `CHIEF_FAFA_AUTO_REVIEW_ENABLED` (default `1`)
+- `CHIEF_FAFA_AUTO_REVIEW_SCRIPT` (auto-review script path)
+- `CHIEF_FAFA_SEEN_HOSTS_FILE` (tracked hosts file path)
 
-```bash
-python3 scripts/weather_mountains_briefing.py
-```
+## Pipeline Usage
 
-Output format includes:
-
-1. Latest forecast by zone (with briefing)
-2. Latest benchmark
-3. Suitability for Cycling/Hiking/Skiing
-4. Forecasting source with confidence %
-5. Latest Full PDF links
-
-### 2) Send briefing to Telegram (auto-splitting long messages)
-
-```bash
-python3 scripts/send_weather_telegram.py
-```
-
-This sender:
-
-- Splits by section (`1)`, `2)`, ...)
-- Further chunks overlong sections
-- Sends plain text (avoids Telegram markdown parse errors)
-
-### 3) OpenClaw cron example
-
-```bash
-openclaw cron add \
-  --name "Scottish Mountains 08:00" \
-  --cron "0 8 * * *" \
-  --tz "Europe/London" \
-  --session isolated \
-  --message "/bash /usr/bin/python3 /home/felixlee/Desktop/aibot/scripts/send_weather_telegram.py" \
-  --no-deliver \
-  --best-effort-deliver
-```
-
-## Chief Fafa Recipe Pipeline
-
-### URL mode
+URL mode:
 
 ```bash
 python3 scripts/chief_fafa_recipe_pipeline.py "https://example.com/recipe" --json --json-brief
 ```
 
-### Full-text recipe mode (multiline / Telegram text)
+Text mode:
 
 ```bash
 cat recipe.txt | python3 scripts/chief_fafa_recipe_pipeline.py --stdin --json --json-brief
 ```
 
-### Saved-recipe enquiry mode
+Enquiry mode:
 
 ```bash
-python3 scripts/chief_fafa_recipe_pipeline.py "find my saved black sesame recipe" --json --json-brief
+python3 scripts/chief_fafa_recipe_pipeline.py "find my black sesame recipe" --json --json-brief
 ```
 
-Lookup order:
+## JSON Brief Contract
 
-1. `memory/` + `MEMORY.md` (long-term notes)
-2. Local recipe run reports in `CHIEF_FAFA_OUTPUT_DIR`
-3. OpenClaw conversation history sessions
-4. Google Docs search (Drive API)
+`--json --json-brief` returns:
 
-### Behavior summary
+- `summary`
+- `google_doc_status`
+- `google_doc_url`
+- `error_message`
+- `reply_message`
 
-- Extracts title, ingredients, methods, media URL from source URL or free text
-- Supports multilingual content handling
-- Generates multi-format content pack (web/Facebook/Instagram/YouTube style)
-- Creates Google Doc note (when Docs credentials are configured)
-- Prevents duplicate recipe docs by checking prior URL runs and existing Google Docs matches before creating a new doc
-- Supports enquiry of previously saved recipes and returns the best matching Google Doc URL when found
-- Automatically triggers source-code auto-review on new URL host formats or URL-flow runtime errors (best-effort)
+`reply_message` is canonical for Telegram:
 
-## Google OAuth Helper (Docs/Keep)
+- 3 lines when no error (`Error:` omitted)
+- 4 lines only when `error_message` is non-empty
 
-1) Generate consent URL:
+## OpenClaw Integration Notes
 
-```bash
-python3 scripts/google_keep_oauth_setup.py --client-secret-file /path/client_secret.json
-```
+- Bind Telegram account `chieffafa` to agent `chief-fafa`.
+- Keep command execution in `CHIEF_FAFA_FAST_MODE=1` for responsiveness.
+- Agent instructions should send `brief.reply_message` verbatim.
+- `process` tool is intentionally denied for `chief-fafa` to avoid interim placeholder replies.
 
-2) Exchange auth code:
+## Troubleshooting
 
-```bash
-python3 scripts/google_keep_oauth_setup.py \
-  --client-secret-file /path/client_secret.json \
-  --code "<AUTH_CODE>"
-```
+- Google Doc not created:
+  - Verify Docs OAuth vars are set and refresh token is valid.
+- URL processed but no structured ingredients:
+  - Enable/install `yt-dlp`; retry with fast mode off for deeper extraction.
+- Duplicate URL returns existing doc:
+  - Expected behavior; pipeline reuses prior document URL.
+- Telegram response includes unexpected formatting:
+  - Ensure agent prompt/instructions still enforce `reply_message` passthrough.
 
-It prints env lines to place in your `.env`.
+## Security
 
-## Security Notes
-
-- Rotate/revoke any token that was shared in chat or logs.
-- Keep `.env`, `credentials/`, `.secrets/`, and `data/` out of git history.
-- Use fine-grained GitHub PATs with minimal scope (`Contents: Read and write` only when needed).
+- Rotate/revoke tokens exposed in chat/logs.
+- Keep `.env`, `credentials/`, `.secrets/`, and generated data out of git.
+- Use fine-grained GitHub PAT scopes only as needed.
