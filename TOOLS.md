@@ -1,0 +1,60 @@
+# TOOLS.md - Local Notes
+
+Skills define _how_ tools work. This file is for _your_ specifics — the stuff that's unique to your setup.
+
+## What Goes Here
+
+Things like:
+
+- Camera names and locations
+- SSH hosts and aliases
+- Preferred voices for TTS
+- Speaker/room names
+- Device nicknames
+- Anything environment-specific
+
+## Examples
+
+```markdown
+### Cameras
+
+- living-room → Main area, 180° wide angle
+- front-door → Entrance, motion-triggered
+
+### SSH
+
+- home-server → 192.168.1.100, user: admin
+
+### TTS
+
+- Preferred voice: "Nova" (warm, slightly British)
+- Default speaker: Kitchen HomePod
+```
+
+## Why Separate?
+
+Skills are shared. Your setup is yours. Keeping them apart means you can update skills without losing your notes, and share skills without leaking your infrastructure.
+
+---
+
+Add whatever helps you do your job. This is your cheat sheet.
+
+## Self-Improve Tool Policy (AIBot)
+
+Safe by default (allowed in autonomous runs):
+
+- python3, bash, rg, git status, git diff, git add, git commit (workspace only)
+- Running local checks and scripts inside /home/felixlee/Desktop/aibot
+
+Approval required (do not run unattended):
+
+- apt, dpkg, snap, system service changes (systemctl, user service install/remove)
+- Network/security policy changes, SSH daemon config, firewall changes
+- Destructive filesystem commands, force-pushes, history rewrites
+
+Delivery rule:
+
+- For long outputs, send concise summary plus path/log reference, not raw dumps.
+
+
+- Auto-commit helper: bash /home/felixlee/Desktop/aibot/scripts/self_improve_autocommit.sh pi-source-sync <reason>
