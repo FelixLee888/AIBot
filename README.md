@@ -59,6 +59,9 @@ Do **not** commit secrets.
 - `CHIEF_FAFA_OPENAI_TIMEOUT_SEC` (optional; timeout tuning)
 - `CHIEF_FAFA_MEMORY_ROOT` (optional; default `/home/felixlee/Desktop/chief-fafa`)
 - `CHIEF_FAFA_OPENCLAW_SESSIONS_DIR` (optional; default `/home/felixlee/.openclaw/agents/chief-fafa/sessions`)
+- `CHIEF_FAFA_AUTO_REVIEW_ENABLED` (optional; default `1`)
+- `CHIEF_FAFA_AUTO_REVIEW_SCRIPT` (optional; default `/home/felixlee/Desktop/chief-fafa/scripts/chief_fafa_auto_review.py`)
+- `CHIEF_FAFA_SEEN_HOSTS_FILE` (optional; default `/home/felixlee/Desktop/chief-fafa/.pi/seen_url_hosts.json`)
 
 ## Yuen Yuen Weather Agent
 
@@ -134,7 +137,9 @@ Lookup order:
 - Supports multilingual content handling
 - Generates multi-format content pack (web/Facebook/Instagram/YouTube style)
 - Creates Google Doc note (when Docs credentials are configured)
+- Prevents duplicate recipe docs by checking prior URL runs and existing Google Docs matches before creating a new doc
 - Supports enquiry of previously saved recipes and returns the best matching Google Doc URL when found
+- Automatically triggers source-code auto-review on new URL host formats or URL-flow runtime errors (best-effort)
 
 ## Google OAuth Helper (Docs/Keep)
 

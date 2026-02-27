@@ -26,7 +26,7 @@ import time
 from html import unescape
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
@@ -56,6 +56,7 @@ VIDEO_URL_HINTS = [
     "tiktok.com",
     "instagram.com",
     "facebook.com",
+    "threads.com",
     "x.com",
     "twitter.com",
     "bilibili.com",
@@ -769,6 +770,11 @@ def short_chat_summary(source: Dict[str, Any], formats: Dict[str, str], source_e
             summary = f"Instagram reel recipe: {title}. Key ingredients: {top_ingredients}."
         else:
             summary = f"Instagram reel recipe captured: {title}."
+    elif "threads.com" in domain:
+        if top_ingredients:
+            summary = f"Threads post recipe: {title}. Key ingredients: {top_ingredients}."
+        else:
+            summary = f"Threads post recipe captured: {title}."
     elif is_video:
         if top_ingredients:
             summary = f"Video recipe captured: {title}. Key ingredients: {top_ingredients}."
@@ -785,6 +791,39 @@ def short_chat_summary(source: Dict[str, Any], formats: Dict[str, str], source_e
     if len(summary) > 220:
         summary = summary[:217].rstrip() + "..."
     return summary
+
+
+def decorate_summary_with_attempt_status(
+    summary: str,
+    initial_url: str,
+    host_hint: str,
+    has_processing_error: bool,
+    auto_review_triggers: List[str],
+) -> str:
+    out = normalize_space(summary)
+    if not out:
+        out = "Processing completed."
+
+    host = host_hint.strip().lower()
+    if not host and initial_url:
+        try:
+            host = urlparse(initial_url).netloc.lower().strip()
+        except Exception:
+            host = ""
+
+    if initial_url and has_processing_error:
+        attempt_text = f"Tried processing URL source ({host}) first." if host else "Tried processing this URL first."
+        if "tried processing" not in out.casefold():
+            out = f"{attempt_text} {out}".strip()
+
+    auto_review_hit = any(str(x).strip().endswith(":triggered") for x in auto_review_triggers)
+    if has_processing_error and auto_review_hit and "self-improve" not in out.casefold():
+        out = f"{out} Self-improve review triggered."
+
+    out = normalize_space(out)
+    if len(out) > 220:
+        out = out[:217].rstrip() + "..."
+    return out
 
 
 def human_readable_doc_summary(source: Dict[str, Any], formats: Dict[str, str]) -> str:
@@ -978,6 +1017,352 @@ def extract_source_url_from_text(text: str) -> str:
                 if url:
                     return url
     return ""
+
+
+def normalize_recipe_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        p = urlparse(raw)
+    except Exception:
+        return raw
+    scheme = (p.scheme or "https").lower()
+    netloc = (p.netloc or "").lower()
+
+    # Canonicalize YouTube variants to reduce duplicate recipe docs for the same video.
+    if netloc in {"youtu.be", "www.youtu.be"}:
+        video_id = p.path.strip("/").split("/")[0]
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+    if netloc.endswith("youtube.com"):
+        path = p.path or "/"
+        q = dict(parse_qsl(p.query, keep_blank_values=False))
+        video_id = q.get("v", "").strip()
+        if not video_id and path.startswith("/shorts/"):
+            video_id = path.split("/shorts/", 1)[1].split("/", 1)[0].strip()
+        if not video_id and path.startswith("/embed/"):
+            video_id = path.split("/embed/", 1)[1].split("/", 1)[0].strip()
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+    if "instagram.com" in netloc:
+        netloc = "www.instagram.com"
+        path = (p.path or "/").strip("/")
+        parts = [x for x in path.split("/") if x]
+        if len(parts) >= 2 and parts[0] in {"reel", "p", "tv"}:
+            return f"https://{netloc}/{parts[0]}/{parts[1]}/"
+        if len(parts) >= 2 and parts[0] == "stories":
+            return f"https://{netloc}/stories/{parts[1]}/"
+    if "facebook.com" in netloc:
+        netloc = "www.facebook.com"
+        path = (p.path or "/").strip("/")
+        parts = [x for x in path.split("/") if x]
+        q = dict(parse_qsl(p.query, keep_blank_values=False))
+        if parts and parts[0] in {"reel", "watch"}:
+            if parts[0] == "reel" and len(parts) >= 2:
+                return f"https://{netloc}/reel/{parts[1]}"
+            if parts[0] == "watch" and q.get("v"):
+                return f"https://{netloc}/watch?v={q.get('v','').strip()}"
+        if len(parts) >= 3 and parts[-2] in {"videos", "reels"}:
+            return f"https://{netloc}/{parts[-2]}/{parts[-1]}"
+        if q.get("v"):
+            return f"https://{netloc}/watch?v={q.get('v','').strip()}"
+    if "threads.com" in netloc:
+        netloc = "www.threads.com"
+        path = (p.path or "/").strip("/")
+        parts = [x for x in path.split("/") if x]
+        if len(parts) >= 3 and parts[1] == "post":
+            return f"https://{netloc}/{parts[0]}/post/{parts[2]}"
+        if len(parts) >= 2 and parts[0] == "post":
+            return f"https://{netloc}/post/{parts[1]}"
+
+    if netloc.endswith(":80") and scheme == "http":
+        netloc = netloc[:-3]
+    if netloc.endswith(":443") and scheme == "https":
+        netloc = netloc[:-4]
+    path = p.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    kept_query: List[str] = []
+    if p.query:
+        for part in p.query.split("&"):
+            if not part:
+                continue
+            key = part.split("=", 1)[0].strip().lower()
+            if key.startswith("utm_"):
+                continue
+            if key in {"fbclid", "gclid", "igshid", "si", "ref"}:
+                continue
+            kept_query.append(part)
+    query = "&".join(sorted(kept_query))
+    rebuilt = f"{scheme}://{netloc}{path}"
+    if query:
+        rebuilt += f"?{query}"
+    return rebuilt
+
+
+def canonical_host_from_url(url: str) -> str:
+    norm = normalize_recipe_url(url)
+    if not norm:
+        return ""
+    try:
+        host = urlparse(norm).netloc.lower()
+    except Exception:
+        return ""
+    for pref in ("www.", "m.", "mbasic.", "mobile."):
+        if host.startswith(pref):
+            host = host[len(pref) :]
+            break
+    return host
+
+
+def read_json_file_safely(path: Path) -> Any:
+    try:
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def write_json_file_safely(path: Path, data: Any) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def detect_and_record_new_url_host(url: str) -> Tuple[bool, str]:
+    host = canonical_host_from_url(url)
+    if not host:
+        return False, ""
+    hosts_path = Path(
+        read_env_value(
+            "CHIEF_FAFA_SEEN_HOSTS_FILE",
+            "/home/felixlee/Desktop/chief-fafa/.pi/seen_url_hosts.json",
+        )
+    )
+    data = read_json_file_safely(hosts_path)
+    if not isinstance(data, dict):
+        data = {"hosts": []}
+    hosts = data.get("hosts", [])
+    if not isinstance(hosts, list):
+        hosts = []
+    known = {str(x).strip().lower() for x in hosts if str(x).strip()}
+    is_new = host not in known
+    if is_new:
+        known.add(host)
+        data["hosts"] = sorted(known)
+        write_json_file_safely(hosts_path, data)
+    return is_new, host
+
+
+def maybe_trigger_auto_review(
+    reason: str,
+    source_url: str,
+    error_message: str = "",
+    input_snippet: str = "",
+) -> str:
+    enabled_raw = read_env_value("CHIEF_FAFA_AUTO_REVIEW_ENABLED", "1").strip().lower()
+    if enabled_raw in {"0", "false", "no", "off"}:
+        return "disabled"
+
+    script_path = Path(
+        read_env_value(
+            "CHIEF_FAFA_AUTO_REVIEW_SCRIPT",
+            "/home/felixlee/Desktop/chief-fafa/scripts/chief_fafa_auto_review.py",
+        )
+    )
+    if not script_path.exists():
+        return "script_missing"
+
+    cmd = [
+        "/usr/bin/python3",
+        str(script_path),
+        "--reason",
+        reason[:120],
+    ]
+    if source_url:
+        cmd.extend(["--source-url", source_url[:500]])
+    if error_message:
+        cmd.extend(["--error", error_message[:1200]])
+    if input_snippet:
+        cmd.extend(["--input-snippet", input_snippet[:1200]])
+
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return "triggered"
+    except Exception as exc:
+        return f"trigger_failed:{exc.__class__.__name__}"
+
+
+def extract_summary_from_report_text(text: str) -> str:
+    lines = [x.rstrip() for x in str(text or "").splitlines()]
+    for idx, line in enumerate(lines):
+        if normalize_space(line).casefold() == "summary:":
+            for j in range(idx + 1, min(len(lines), idx + 7)):
+                cand = normalize_space(lines[j])
+                if cand:
+                    return cand[:240]
+    return ""
+
+
+def find_existing_doc_in_notes_by_url(source_url: str, notes_root: Path, limit_files: int = 450) -> Dict[str, Any]:
+    norm_url = normalize_recipe_url(source_url)
+    if not norm_url or not is_accessible_dir(notes_root):
+        return {"found": False}
+
+    files = sorted(notes_root.glob("*.md"), key=lambda p: p.stat().st_mtime if is_accessible_file(p) else 0, reverse=True)
+    latest_seen: Dict[str, Any] = {"found": False}
+    for path in files[:limit_files]:
+        if "-enquiry-" in path.name:
+            continue
+        raw = read_text_safely(path, max_chars=200000)
+        if not raw:
+            continue
+        report_url = extract_source_url_from_text(raw)
+        if not report_url:
+            continue
+        if normalize_recipe_url(report_url) != norm_url:
+            continue
+        title = extract_title_from_report_text(raw, path.stem.replace("-", " "))
+        summary = extract_summary_from_report_text(raw)
+        doc_url = extract_doc_url_from_text(raw)
+        candidate = {
+            "found": bool(doc_url),
+            "match_type": "notes_url_match",
+            "title": title,
+            "summary": summary,
+            "source_url": report_url,
+            "normalized_url": norm_url,
+            "doc_url": doc_url,
+            "note_path": str(path),
+            "modified": int(path.stat().st_mtime),
+        }
+        if doc_url:
+            return candidate
+        if not latest_seen.get("note_path"):
+            latest_seen = candidate
+    return latest_seen
+
+
+def google_drive_find_existing_doc_by_source_url(source_url: str, limit: int = 8) -> Tuple[Dict[str, Any], str]:
+    token, err = resolve_docs_access_token()
+    if not token:
+        return {"found": False}, err or "missing Google Docs token"
+
+    norm_url = normalize_recipe_url(source_url)
+    if not norm_url:
+        return {"found": False}, "source url missing"
+    parsed = urlparse(norm_url)
+    host = parsed.netloc.lower()
+    tail = Path(parsed.path).name.strip().lower()
+    terms = [host] if host else []
+    if tail and tail not in terms:
+        terms.append(tail)
+    if not terms:
+        return {"found": False}, "url terms missing"
+
+    clauses = []
+    for term in terms[:2]:
+        esc = escape_drive_query_literal(term)
+        clauses.append(f"fullText contains '{esc}'")
+    query = "mimeType='application/vnd.google-apps.document' and trashed=false and (" + " and ".join(clauses) + ")"
+
+    headers = {"Authorization": f"Bearer {token}"}
+    quota_project = resolve_docs_quota_project()
+    if quota_project:
+        headers["X-Goog-User-Project"] = quota_project
+    params = {
+        "q": query,
+        "spaces": "drive",
+        "pageSize": max(1, min(25, int(limit))),
+        "orderBy": "modifiedTime desc",
+        "fields": "files(id,name,webViewLink,modifiedTime)",
+    }
+    try:
+        resp = requests.get(
+            f"{GOOGLE_DRIVE_API_BASE}",
+            headers=headers,
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+        data = resp.json() if resp.text else {}
+    except Exception as exc:
+        return {"found": False}, f"Google Docs URL search failed ({exc.__class__.__name__}: {exc})"
+    if resp.status_code >= 400:
+        detail = extract_google_api_error(data)
+        return {"found": False}, f"Google Docs URL search HTTP {resp.status_code}: {detail or 'request failed'}"
+
+    files = data.get("files", []) if isinstance(data, dict) else []
+    if not isinstance(files, list):
+        files = []
+    for item in files[:limit]:
+        if not isinstance(item, dict):
+            continue
+        file_id = str(item.get("id", "")).strip()
+        if not file_id:
+            continue
+        title = decode_html_text(str(item.get("name", ""))).strip() or "Untitled document"
+        doc_url = str(item.get("webViewLink", "")).strip()
+        if not doc_url:
+            doc_url = f"https://docs.google.com/document/d/{file_id}/edit"
+
+        verified = False
+        try:
+            export_resp = requests.get(
+                f"{GOOGLE_DRIVE_API_BASE}/{file_id}/export",
+                headers=headers,
+                params={"mimeType": "text/plain"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if export_resp.status_code < 400:
+                body = export_resp.text or ""
+                if source_url in body or norm_url in body:
+                    verified = True
+        except Exception:
+            verified = False
+
+        if verified:
+            return (
+                {
+                    "found": True,
+                    "match_type": "google_docs_url_match",
+                    "title": title,
+                    "summary": f"Existing Google Doc matched source URL ({host}).",
+                    "source_url": source_url,
+                    "normalized_url": norm_url,
+                    "doc_url": doc_url,
+                    "note_path": "",
+                    "modified": int(dt.datetime.now(dt.timezone.utc).timestamp()),
+                },
+                "",
+            )
+    return {"found": False}, ""
+
+
+def find_existing_recipe_doc_for_url(source_url: str, notes_root: Path) -> Dict[str, Any]:
+    note_hit = find_existing_doc_in_notes_by_url(source_url, notes_root=notes_root)
+    if bool(note_hit.get("found")) and str(note_hit.get("doc_url", "")).strip():
+        return note_hit
+
+    drive_hit, drive_err = google_drive_find_existing_doc_by_source_url(source_url)
+    if bool(drive_hit.get("found")) and str(drive_hit.get("doc_url", "")).strip():
+        return drive_hit
+
+    out = {"found": False}
+    if note_hit.get("note_path"):
+        out["note_hit_without_doc"] = note_hit
+    if drive_err:
+        out["check_error"] = drive_err
+    return out
 
 
 def extract_title_from_report_text(text: str, fallback: str) -> str:
@@ -1542,7 +1927,7 @@ def is_video_source_url(url: str) -> bool:
     query = parsed.query.lower()
     if any(hint in host for hint in VIDEO_URL_HINTS):
         return True
-    if any(tag in path for tag in ["/watch", "/video", "/videos", "/reel", "/shorts", "/clip", "/tv/"]):
+    if any(tag in path for tag in ["/watch", "/video", "/videos", "/reel", "/shorts", "/clip", "/tv/", "/post/"]):
         return True
     if any(tag in query for tag in ["v=", "video", "watch"]):
         return True
@@ -2941,6 +3326,23 @@ def format_enquiry_markdown_report(lookup: Dict[str, Any]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def format_duplicate_markdown_report(hit: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    lines.append(f"Chief Fafa Recipe Duplicate Check - {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    lines.append("")
+    lines.append(f"Match type: {hit.get('match_type', '')}")
+    lines.append(f"Title: {hit.get('title', '')}")
+    lines.append(f"Source URL: {hit.get('source_url', '')}")
+    lines.append(f"Google Doc URL: {hit.get('doc_url', '')}")
+    if hit.get("note_path"):
+        lines.append(f"Note path: {hit.get('note_path', '')}")
+    if hit.get("summary"):
+        lines.append("")
+        lines.append("Summary:")
+        lines.append(str(hit.get("summary", "")))
+    return "\n".join(lines).strip() + "\n"
+
+
 def extract_source_payload(url: str) -> Dict[str, Any]:
     final_url, html = fetch_page(url)
     title = extract_title(html)
@@ -3079,6 +3481,23 @@ def main() -> None:
         output_dir = Path(tempfile.gettempdir()) / "chief-fafa-notes"
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    initial_input_url = extract_first_url(raw_source)
+    auto_review_triggers: List[str] = []
+    new_host_detected = False
+    new_host_name = ""
+    if initial_input_url:
+        is_new_host, host = detect_and_record_new_url_host(initial_input_url)
+        new_host_detected = bool(is_new_host)
+        new_host_name = str(host or "").strip().lower()
+        if is_new_host:
+            trigger_state = maybe_trigger_auto_review(
+                reason="new_url_host",
+                source_url=initial_input_url,
+                error_message="",
+                input_snippet=raw_source,
+            )
+            auto_review_triggers.append(f"new_url_host:{host}:{trigger_state}")
+
     if raw_source and looks_like_recipe_enquiry(raw_source):
         lookup = run_recipe_enquiry(raw_source, output_dir=output_dir)
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -3103,6 +3522,7 @@ def main() -> None:
                     "google_doc_url": str(lookup.get("google_doc_url", "")).strip(),
                     "error_message": str(lookup.get("error_message", "")).strip(),
                     "lookup": lookup,
+                    "auto_review_triggers": auto_review_triggers,
                     "report_path": str(report_path),
                 }
                 print(json.dumps(brief, ensure_ascii=True, indent=2))
@@ -3112,6 +3532,41 @@ def main() -> None:
             print(report_markdown)
             print(f"Report saved: {report_path}")
         return
+
+    if initial_input_url and not args.no_doc and not args.no_keep:
+        initial_dup = find_existing_recipe_doc_for_url(initial_input_url, notes_root=output_dir)
+        if bool(initial_dup.get("found")) and str(initial_dup.get("doc_url", "")).strip():
+            stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+            slug = slugify(f"duplicate-{initial_dup.get('title', 'recipe')}")
+            report_path = output_dir / f"{stamp}-{slug}.md"
+            report_markdown = format_duplicate_markdown_report(initial_dup)
+            report_path.write_text(report_markdown, encoding="utf-8")
+
+            duplicate_summary = (
+                f"Recipe already exists for this URL. Reusing existing Google Doc: "
+                f"{decode_html_text(str(initial_dup.get('title', 'Recipe')))}."
+            )
+            brief = {
+                "ok": True,
+                "summary": duplicate_summary[:220],
+                "google_doc_status": "exists",
+                "google_doc_url": str(initial_dup.get("doc_url", "")).strip(),
+                "error_message": "",
+                "doc": {
+                    "ok": True,
+                    "url": str(initial_dup.get("doc_url", "")).strip(),
+                    "message": "already exists; skipped duplicate creation",
+                },
+                "duplicate": initial_dup,
+                "auto_review_triggers": auto_review_triggers,
+                "report_path": str(report_path),
+            }
+            if args.json:
+                print(json.dumps(brief, ensure_ascii=True, indent=2))
+            else:
+                print(report_markdown)
+                print(f"Report saved: {report_path}")
+            return
 
     if not raw_source:
         source = {
@@ -3176,9 +3631,23 @@ def main() -> None:
 
     summary_for_doc = human_readable_doc_summary(source, formats)
 
+    duplicate_hit_post_fetch: Dict[str, Any] = {}
+    duplicate_check_error = ""
+    if str(source.get("url", "")).strip() and not validation_error and not args.no_doc and not args.no_keep:
+        post_dup = find_existing_recipe_doc_for_url(str(source.get("url", "")), notes_root=output_dir)
+        if bool(post_dup.get("found")) and str(post_dup.get("doc_url", "")).strip():
+            duplicate_hit_post_fetch = post_dup
+        duplicate_check_error = str(post_dup.get("check_error", "")).strip()
+
     note_result: Dict[str, Any] = {"ok": False, "message": "skipped"}
     if validation_error:
         note_result = {"ok": False, "message": validation_error}
+    elif duplicate_hit_post_fetch:
+        note_result = {
+            "ok": True,
+            "url": str(duplicate_hit_post_fetch.get("doc_url", "")).strip(),
+            "message": "already exists; skipped duplicate creation",
+        }
     elif not args.no_doc and not args.no_keep:
         note_title = f"Chief Fafa - {source.get('title', 'Recipe')}"[:120]
         note_body = build_google_doc_recipe_text(source, summary_for_doc)
@@ -3197,14 +3666,23 @@ def main() -> None:
         "image_url": source.get("image_url", ""),
         "doc": note_result,
         "note": note_result,
+        "auto_review_triggers": auto_review_triggers,
         "report_path": str(report_path),
         "formats": formats,
     }
 
     if args.json:
         if args.json_brief:
-            summary = short_chat_summary(source, formats, source_error)
+            if duplicate_hit_post_fetch:
+                summary = (
+                    f"Recipe already exists for this URL. Reusing existing Google Doc: "
+                    f"{decode_html_text(str(duplicate_hit_post_fetch.get('title', source.get('title', 'Recipe'))))}."
+                )
+            else:
+                summary = short_chat_summary(source, formats, source_error)
             doc_status = "ok" if bool(note_result.get("ok")) else "failed"
+            if duplicate_hit_post_fetch:
+                doc_status = "exists"
             doc_url = str(note_result.get("url", "")).strip()
             error_messages: List[str] = []
             if source_error:
@@ -3220,6 +3698,8 @@ def main() -> None:
             include_ai_err = bool(ai_err) and not ai_err.startswith("OpenAI skipped")
             if include_ai_err and not error_messages:
                 error_messages.append(ai_err)
+            if duplicate_check_error and not duplicate_hit_post_fetch:
+                error_messages.append(duplicate_check_error)
             deduped_errors: List[str] = []
             seen_errors: set[str] = set()
             for item in error_messages:
@@ -3231,6 +3711,55 @@ def main() -> None:
                 seen_errors.add(msg)
                 deduped_errors.append(msg)
             error_message = " | ".join(deduped_errors).strip()
+
+            source_url_for_review = str(source.get("url", "")).strip() or initial_input_url
+            if source_url_for_review and source_error:
+                trigger_state = maybe_trigger_auto_review(
+                    reason="pipeline_error",
+                    source_url=source_url_for_review,
+                    error_message=source_error,
+                    input_snippet=raw_source,
+                )
+                auto_review_triggers.append(f"pipeline_error:{trigger_state}")
+            elif source_url_for_review and error_message:
+                low = error_message.casefold()
+                if "not configured" not in low:
+                    likely_processing_issue = any(
+                        token in low
+                        for token in [
+                            "failed",
+                            "timeout",
+                            "http ",
+                            "exception",
+                            "traceback",
+                            "unsupported",
+                            "unavailable",
+                            "not a valid",
+                            "missing",
+                            "error",
+                        ]
+                    )
+                    if doc_status == "failed" or likely_processing_issue:
+                        trigger_state = maybe_trigger_auto_review(
+                            reason="pipeline_error",
+                            source_url=source_url_for_review,
+                            error_message=error_message,
+                            input_snippet=raw_source,
+                        )
+                        auto_review_triggers.append(f"pipeline_error:{trigger_state}")
+
+            has_processing_error = bool(source_error or error_message)
+            host_hint = new_host_name
+            if not host_hint and initial_input_url and has_processing_error and new_host_detected:
+                host_hint = canonical_host_from_url(initial_input_url)
+            summary = decorate_summary_with_attempt_status(
+                summary=summary,
+                initial_url=initial_input_url,
+                host_hint=host_hint,
+                has_processing_error=has_processing_error,
+                auto_review_triggers=auto_review_triggers,
+            )
+
             brief = {
                 "ok": bool(result.get("ok")),
                 "summary": summary,
@@ -3238,6 +3767,8 @@ def main() -> None:
                 "google_doc_url": doc_url,
                 "error_message": error_message,
                 "doc": note_result,
+                "duplicate": duplicate_hit_post_fetch if duplicate_hit_post_fetch else {},
+                "auto_review_triggers": auto_review_triggers,
                 "report_path": str(report_path),
             }
             print(json.dumps(brief, ensure_ascii=True, indent=2))
