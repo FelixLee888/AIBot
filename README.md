@@ -12,6 +12,29 @@ Yuen Yuen Weather Bot generates a daily Scotland mountain briefing, benchmarks f
 - Source benchmarking with rolling confidence
 - Telegram delivery that splits long reports into multiple messages
 
+## Infrastructure Diagram
+
+```mermaid
+flowchart LR
+  A["OpenClaw Cron (08:00 Europe/London)"] --> B["send_weather_telegram.py"]
+  B --> C["weather_mountains_briefing.py"]
+
+  C --> D["Open-Meteo API"]
+  C --> E["OpenWeather API"]
+  C --> F["Met Office Site Specific API"]
+  C --> G["Met Office Atmospheric Models (GRIB)"]
+  C --> H["MWIS Forecast/PDF Links"]
+
+  C --> I["SQLite Benchmark Store<br/>data/weather_benchmark.sqlite3"]
+  I --> C
+
+  C --> J["5-section Weather Report"]
+  J --> B
+  B --> K["Chunking + Section Splitter"]
+  K --> L["Telegram Bot API"]
+  L --> M["Telegram Chat / Group"]
+```
+
 ## Scripts
 
 - `scripts/weather_mountains_briefing.py`
