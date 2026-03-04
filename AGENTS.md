@@ -220,8 +220,9 @@ When running autonomous maintenance or self-improvement tasks:
 - Never modify OpenClaw runtime state directly under /home/felixlee/.openclaw/ unless explicitly asked.
 - Prefer minimal patches. Avoid broad refactors during unattended runs.
 - Always run bash /home/felixlee/Desktop/aibot/scripts/self_improve_check.sh after changes.
-- For any self-improve code/doc change, run bash /home/felixlee/Desktop/aibot/scripts/self_improve_autocommit.sh pi-source-sync self-improve before final response.
+- For any self-improve code/doc change, run bash /home/felixlee/Desktop/aibot/scripts/self_improve_autocommit.sh main self-improve before final response. If it returns approval_required, wait for Telegram approval before rerunning.
 - If checks fail, do not claim success. Report failure summary and stop.
+- Approval command: /usr/bin/python3 /home/felixlee/Desktop/aibot/scripts/self_improve_approval_gate.py approve --workspace /home/felixlee/Desktop/aibot --code <CODE> --approver-id <TELEGRAM_USER_ID> (allowed approvers: 6683969437, 8713835432).
 - Do not execute destructive commands (rm -rf, git reset --hard, mass deletes).
 - External/system changes (apt installs, systemd changes, firewall/network changes) require explicit human approval.
 - If creating a new app/module is necessary, create under /home/felixlee/Desktop/aibot/apps/ with a short README.md and tests.

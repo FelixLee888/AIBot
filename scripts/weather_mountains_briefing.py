@@ -21,6 +21,7 @@ Atmospheric GRIB extraction requires Python package `eccodes`.
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import base64
 import json
@@ -72,6 +73,54 @@ def resolve_data_dir() -> Path:
 
 DATA_DIR = resolve_data_dir()
 DB_PATH = DATA_DIR / "weather_benchmark.sqlite3"
+
+
+def resolve_memory_root() -> Path:
+    override = os.getenv("AIBOT_MEMORY_ROOT", "").strip()
+    candidates: List[Path] = []
+    if override:
+        candidates.append(Path(override))
+
+    candidates.extend([
+        DATA_DIR.parent,
+        Path("/home/felixlee/Desktop/aibot"),
+        Path.home() / "Desktop/aibot",
+        Path(__file__).resolve().parent.parent,
+    ])
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except Exception:
+            continue
+
+    fallback = Path(__file__).resolve().parent.parent
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+MEMORY_ROOT = resolve_memory_root()
+MEMORY_DIR = MEMORY_ROOT / "memory"
+HEARTBEAT_STATE_PATH = MEMORY_DIR / "heartbeat-state.json"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate Scottish mountain weather briefings in full or compact form.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("full", "compact"),
+        default="full",
+        help="Select output style (default: full)",
+    )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Shortcut for --mode compact",
+    )
+    return parser.parse_args()
 
 SOURCE_OPEN_METEO = "open_meteo"
 SOURCE_MET_NO = "met_no"
@@ -186,6 +235,89 @@ def london_today() -> dt.date:
 
 def iso(d: dt.date) -> str:
     return d.isoformat()
+
+
+def utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def memory_clean_text(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def append_daily_memory_note(run_date: str, lines: Sequence[str]) -> None:
+    try:
+        MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+        daily_path = MEMORY_DIR / f"{run_date}.md"
+        if daily_path.exists():
+            base = daily_path.read_text(encoding="utf-8", errors="ignore").rstrip() + "\n\n"
+        else:
+            base = f"# Memory Log - {run_date}\n\n"
+        cleaned_lines = [memory_clean_text(x) for x in lines]
+        entry = "\n".join([x for x in cleaned_lines if x]).strip()
+        if not entry:
+            return
+        daily_path.write_text(base + entry + "\n", encoding="utf-8")
+    except Exception:
+        return
+
+
+def update_heartbeat_state(check_name: str, status: str, details: Optional[Dict[str, object]] = None) -> None:
+    try:
+        MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+        payload: Dict[str, object] = {}
+        if HEARTBEAT_STATE_PATH.exists():
+            try:
+                payload = json.loads(HEARTBEAT_STATE_PATH.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    payload = {}
+            except Exception:
+                payload = {}
+        checks_obj = payload.get("checks", {})
+        checks: Dict[str, object] = checks_obj if isinstance(checks_obj, dict) else {}
+
+        now_iso = utc_now_iso()
+        check_obj = checks.get(check_name, {})
+        check = check_obj if isinstance(check_obj, dict) else {}
+        check["status"] = status
+        check["last_run_utc"] = now_iso
+        if status == "ok":
+            check["last_success_utc"] = now_iso
+        if isinstance(details, dict) and details:
+            check["details"] = details
+        checks[check_name] = check
+
+        payload["version"] = 1
+        payload["updated_at_utc"] = now_iso
+        payload["checks"] = checks
+        HEARTBEAT_STATE_PATH.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    except Exception:
+        return
+
+
+def persist_weather_memory_entry(
+    run_date: str,
+    forecast_date: str,
+    eval_date: str,
+    active_sources: Sequence[str],
+    available_sources: Sequence[str],
+    missing_sources: Sequence[str],
+    skipped_error_sources: Sequence[str],
+) -> None:
+    active_labels = ", ".join(SOURCE_LABELS.get(s, s) for s in active_sources) or "(none)"
+    available_labels = ", ".join(SOURCE_LABELS.get(s, s) for s in available_sources) or "(none)"
+    missing_labels = ", ".join(SOURCE_LABELS.get(s, s) for s in missing_sources) or "(none)"
+    skipped_labels = ", ".join(SOURCE_LABELS.get(s, s) for s in skipped_error_sources) or "(none)"
+    now_iso = utc_now_iso()
+    lines = [
+        f"- [{now_iso}] weather_briefing run",
+        f"  forecast_date: {forecast_date}, eval_date: {eval_date}",
+        f"  sources_active: {active_labels}",
+        f"  sources_available: {available_labels}",
+        f"  sources_missing: {missing_labels}",
+        f"  sources_skipped_error: {skipped_labels}",
+    ]
+    append_daily_memory_note(run_date, lines)
 
 
 def to_float(value) -> Optional[float]:
@@ -1958,6 +2090,27 @@ def best_window_from_conditions(tmin: Optional[float], tmax: Optional[float], wi
     return "best window is mid-morning through mid-afternoon"
 
 
+def concise_best_window(tmin: Optional[float], tmax: Optional[float], wind_kmh: Optional[float]) -> str:
+    window = best_window_from_conditions(tmin, tmax, wind_kmh)
+    prefix = "best window is "
+    if window.lower().startswith(prefix):
+        window = window[len(prefix):]
+    return window.capitalize()
+
+
+def freeze_condition_phrase(tmin: Optional[float], tmax: Optional[float], short: bool = False) -> str:
+    long_note = ""
+    short_note = ""
+    if tmax is not None and tmax <= 1:
+        long_note = "Temperatures stay near/below freezing on higher ground."
+        short_note = "sub-freezing tops"
+    elif tmin is not None and tmin <= 0:
+        long_note = "Early frost/ice risk on exposed sections."
+        short_note = "early ice risk"
+
+    return short_note if short else long_note
+
+
 def zone_briefing_line(
     name: str,
     tmin: Optional[float],
@@ -1982,15 +2135,12 @@ def zone_briefing_line(
     if stability_notes:
         stability_text = "; " + ", ".join(stability_notes)
 
-    freezing_line = ""
-    if tmax is not None and tmax <= 1:
-        freezing_line = " Temperatures stay near/below freezing on higher ground."
-    elif tmin is not None and tmin <= 0:
-        freezing_line = " Early frost/ice risk on exposed sections."
+    freezing_line = freeze_condition_phrase(tmin, tmax)
+    freezing_suffix = f" {freezing_line}" if freezing_line else ""
 
     return (
         f"- {name} - {temp_part}. {wind_desc}, peaking near {wind_part}{stability_text}. "
-        f"{best_window_from_conditions(tmin, tmax, wind_kmh)}.{freezing_line}"
+        f"{best_window_from_conditions(tmin, tmax, wind_kmh)}.{freezing_suffix}"
     )
 
 
@@ -2121,14 +2271,64 @@ def activity_suitability_block(
     return lines
 
 
-def build_briefing(
+def compact_condition_hint(tmin: Optional[float], tmax: Optional[float], wind_kmh: Optional[float]) -> str:
+    hints: List[str] = []
+    if tmin is not None and tmin <= 0:
+        hints.append("icy AM")
+    if wind_kmh is not None and wind_kmh >= 30:
+        hints.append("gusty tops")
+    if not hints:
+        hints.append("settled")
+    return ", ".join(hints)
+
+
+def rating_initial(label: str) -> str:
+    return (label[:1] if label else "?").upper()
+
+
+def compute_zone_rows(
+    available_sources: Sequence[str],
+    forecasts: Dict[str, Dict[str, Dict[str, Optional[float]]]],
+    weights: Dict[str, float],
+) -> Dict[str, Dict[str, Optional[float]]]:
+    zone_rows: Dict[str, Dict[str, Optional[float]]] = {}
+    source_list = list(available_sources)
+
+    for loc in LOCATIONS:
+        name = loc["name"]
+        source_rows = forecasts.get(name, {})
+        if not source_list:
+            source_keys = list(source_rows.keys())
+        else:
+            source_keys = source_list
+
+        tmax_by_source = {s: source_rows.get(s, {}).get("temp_max") for s in source_keys}
+        tmin_by_source = {s: source_rows.get(s, {}).get("temp_min") for s in source_keys}
+        wind_by_source = {s: source_rows.get(s, {}).get("wind_max") for s in source_keys}
+
+        tmax = weighted_metric(tmax_by_source, weights)
+        tmin = weighted_metric(tmin_by_source, weights)
+        wind = weighted_metric(wind_by_source, weights)
+
+        zone_rows[name] = {
+            "temp_max": tmax,
+            "temp_min": tmin,
+            "wind_max": wind,
+            "spread_temp": spread(tmax_by_source),
+            "spread_wind": spread(wind_by_source),
+        }
+
+    return zone_rows
+
+
+def build_full_briefing(
     forecast_date: str,
     eval_date: str,
     configured_sources: Sequence[str],
     available_sources: Sequence[str],
     skipped_error_sources: Sequence[str],
     missing_sources: Sequence[str],
-    forecasts: Dict[str, Dict[str, Dict[str, Optional[float]]]],
+    zone_rows: Dict[str, Dict[str, Optional[float]]],
     rolling: Dict[str, Dict[str, float]],
     weights: Dict[str, float],
     eval_results: Dict[str, Dict[str, Optional[float]]],
@@ -2142,34 +2342,20 @@ def build_briefing(
     report_sources = [s for s in configured_sources if s in available_sources]
 
     lines.append("1) Latest forecast by zone (with briefing)")
-    zone_rows: Dict[str, Dict[str, Optional[float]]] = {}
 
     for loc in LOCATIONS:
         name = loc["name"]
-        source_rows = forecasts.get(name, {})
-
-        tmax_by_source = {s: source_rows.get(s, {}).get("temp_max") for s in available_sources}
-        tmin_by_source = {s: source_rows.get(s, {}).get("temp_min") for s in available_sources}
-        wind_by_source = {s: source_rows.get(s, {}).get("wind_max") for s in available_sources}
-
-        tmax = weighted_metric(tmax_by_source, weights)
-        tmin = weighted_metric(tmin_by_source, weights)
-        wind = weighted_metric(wind_by_source, weights)
-
-        spread_temp = spread(tmax_by_source)
-        spread_wind = spread(wind_by_source)
-
-        spread_note = ""
-        if spread_temp is not None or spread_wind is not None:
-            spread_note = f" (spread Tmax {fmt(spread_temp)}C, Wind {fmt(spread_wind)} km/h)"
-
-        lines.append(zone_briefing_line(name, tmin, tmax, wind, spread_temp, spread_wind))
-        zone_rows[name] = {
-            "temp_max": tmax,
-            "temp_min": tmin,
-            "wind_max": wind,
-            "spread_note": None if not spread_note else 1.0,
-        }
+        row = zone_rows.get(name, {})
+        lines.append(
+            zone_briefing_line(
+                name,
+                row.get("temp_min"),
+                row.get("temp_max"),
+                row.get("wind_max"),
+                row.get("spread_temp"),
+                row.get("spread_wind"),
+            )
+        )
 
     lines.append("")
     lines.append(f"2) Latest benchmark ({eval_date})")
@@ -2235,7 +2421,115 @@ def build_briefing(
     return "\n".join(lines)
 
 
+def build_compact_briefing(
+    forecast_date: str,
+    eval_date: str,
+    configured_sources: Sequence[str],
+    available_sources: Sequence[str],
+    skipped_error_sources: Sequence[str],
+    missing_sources: Sequence[str],
+    zone_rows: Dict[str, Dict[str, Optional[float]]],
+    rolling: Dict[str, Dict[str, float]],
+    weights: Dict[str, float],
+    eval_results: Dict[str, Dict[str, Optional[float]]],
+    mwis_links: List[str],
+) -> str:
+    report_sources = [s for s in configured_sources if s in available_sources]
+
+    lines: List[str] = []
+    lines.append(f"Scottish mountains quick briefing - {forecast_date} (UK)")
+    lines.append("Compact daily snapshot; run `--mode full` for the detailed 5-section report.")
+    lines.append("")
+
+    lines.append("Zone snapshot (min→max °C, peak wind km/h):")
+    for loc in LOCATIONS:
+        name = loc["name"]
+        row = zone_rows.get(name, {})
+        tmin = row.get("temp_min")
+        tmax = row.get("temp_max")
+        wind = row.get("wind_max")
+        window = concise_best_window(tmin, tmax, wind)
+        freeze_short = freeze_condition_phrase(tmin, tmax, short=True)
+        spread_flags: List[str] = []
+        if row.get("spread_temp") is not None and row.get("spread_temp") >= 4:
+            spread_flags.append("temp spread high")
+        if row.get("spread_wind") is not None and row.get("spread_wind") >= 15:
+            spread_flags.append("wind spread high")
+        extras = "; ".join(flag for flag in [freeze_short, *spread_flags] if flag)
+        extras_text = f" | {extras}" if extras else ""
+        lines.append(
+            f"- {name}: {fmt(tmin)}→{fmt(tmax)}°C, {fmt(wind)} km/h ({wind_band(wind)}). "
+            f"Window {window}{extras_text}"
+        )
+
+    lines.append("")
+    lines.append("Activities (Cycling/Hiking/Skiing ratings):")
+    for loc in LOCATIONS:
+        name = loc["name"]
+        row = zone_rows.get(name, {})
+        suitability = activity_suitability(row.get("temp_min"), row.get("temp_max"), row.get("wind_max"))
+        ratings = "/".join(
+            [
+                rating_initial(suitability.get("cycling")),
+                rating_initial(suitability.get("hiking")),
+                rating_initial(suitability.get("skiing")),
+            ]
+        )
+        hint = compact_condition_hint(row.get("temp_min"), row.get("temp_max"), row.get("wind_max"))
+        lines.append(f"- {name}: {ratings} ({hint})")
+
+    lines.append("")
+    lines.append(f"Benchmarks ({eval_date}):")
+    if eval_results:
+        for source in report_sources:
+            if source not in eval_results:
+                continue
+            r = eval_results[source]
+            lines.append(
+                f"- {SOURCE_LABELS.get(source, source)}: conf {fmt(r.get('confidence'))}% | "
+                f"Tmax {fmt(r.get('mae_temp_max'))}C, Tmin {fmt(r.get('mae_temp_min'))}C, Wind {fmt(r.get('mae_wind_max'))} km/h"
+            )
+    else:
+        lines.append("- Not enough scored history yet.")
+
+    lines.append("")
+    lines.append(f"Sources & weights (last {LOOKBACK_DAYS} days):")
+    if report_sources:
+        for source in report_sources:
+            conf = rolling[source]["rolling_confidence"]
+            samples = int(rolling[source]["samples"])
+            weight_pct = weights.get(source, 0.0) * 100.0
+            lines.append(
+                f"- {SOURCE_LABELS.get(source, source)}: {fmt(conf)}% conf, weight {fmt(weight_pct)}%, samples {samples}"
+            )
+    else:
+        lines.append("- No source produced usable metrics for this run.")
+
+    if skipped_error_sources:
+        skipped_labels = ", ".join(SOURCE_LABELS.get(s, s) for s in skipped_error_sources)
+        lines.append(f"Skipped due to fetch errors: {skipped_labels}")
+
+    if missing_sources:
+        missing_labels = ", ".join(SOURCE_LABELS.get(s, s) for s in missing_sources)
+        lines.append(f"Missing API keys: {missing_labels}")
+
+    lines.append("")
+    lines.append("MWIS PDFs:")
+    if mwis_links:
+        for link in mwis_links[:3]:
+            lines.append(f"- {link}")
+        if len(mwis_links) > 3:
+            lines.append(f"- +{len(mwis_links) - 3} more at mwis.org.uk/forecasts")
+    else:
+        lines.append("- No PDF links found in this run.")
+
+    return "\n".join(lines)
+
+
 def main() -> None:
+    args = parse_args()
+    mode = "compact" if args.compact else args.mode
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     RUNTIME_SOURCE_NOTES.clear()
 
@@ -2263,22 +2557,61 @@ def main() -> None:
         store_weights(conn, date_str=run_date, weights=weights, rolling=rolling, lookback_days=LOOKBACK_DAYS)
 
         forecasts = latest_forecasts_by_location(conn, target_date=forecast_date, sources=available_sources)
+        zone_rows = compute_zone_rows(available_sources=available_sources, forecasts=forecasts, weights=weights)
         mwis_links = fetch_mwis_latest_pdf_links(limit=5)
 
-        briefing = build_briefing(
+        if mode == "compact":
+            briefing = build_compact_briefing(
+                forecast_date=forecast_date,
+                eval_date=eval_date,
+                configured_sources=active_sources,
+                available_sources=available_sources,
+                skipped_error_sources=skipped_error_sources,
+                missing_sources=missing_sources,
+                zone_rows=zone_rows,
+                rolling=rolling,
+                weights=weights,
+                eval_results=eval_results,
+                mwis_links=mwis_links,
+            )
+        else:
+            briefing = build_full_briefing(
+                forecast_date=forecast_date,
+                eval_date=eval_date,
+                configured_sources=active_sources,
+                available_sources=available_sources,
+                skipped_error_sources=skipped_error_sources,
+                missing_sources=missing_sources,
+                zone_rows=zone_rows,
+                rolling=rolling,
+                weights=weights,
+                eval_results=eval_results,
+                mwis_links=mwis_links,
+            )
+
+        persist_weather_memory_entry(
+            run_date=run_date,
             forecast_date=forecast_date,
             eval_date=eval_date,
-            configured_sources=active_sources,
+            active_sources=active_sources,
             available_sources=available_sources,
-            skipped_error_sources=skipped_error_sources,
             missing_sources=missing_sources,
-            forecasts=forecasts,
-            rolling=rolling,
-            weights=weights,
-            eval_results=eval_results,
-            mwis_links=mwis_links,
+            skipped_error_sources=skipped_error_sources,
         )
-
+        update_heartbeat_state(
+            "weather_briefing",
+            "ok",
+            {
+                "run_date": run_date,
+                "forecast_date": forecast_date,
+                "eval_date": eval_date,
+                "active_source_count": len(active_sources),
+                "available_source_count": len(available_sources),
+                "missing_source_count": len(missing_sources),
+                "skipped_error_source_count": len(skipped_error_sources),
+                "db_path": str(DB_PATH),
+            },
+        )
         print(briefing)
 
 
@@ -2288,6 +2621,15 @@ if __name__ == "__main__":
     except Exception as exc:
         today = london_today()
         forecast_date = iso(today + dt.timedelta(days=1))
+        update_heartbeat_state(
+            "weather_briefing",
+            "failed",
+            {
+                "forecast_date": forecast_date,
+                "error": f"{exc.__class__.__name__}: {exc}",
+                "db_path": str(DB_PATH),
+            },
+        )
         print(f"Scottish mountains forecast (adaptive) - {forecast_date} (UK)")
         print("Daily report generated with degraded mode due internal error.")
         print(f"Error: {exc.__class__.__name__}: {exc}")

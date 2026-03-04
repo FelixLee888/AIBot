@@ -57,4 +57,6 @@ Delivery rule:
 - For long outputs, send concise summary plus path/log reference, not raw dumps.
 
 
-- Auto-commit helper: bash /home/felixlee/Desktop/aibot/scripts/self_improve_autocommit.sh pi-source-sync <reason>
+- Auto-commit helper (approval-gated): bash /home/felixlee/Desktop/aibot/scripts/self_improve_autocommit.sh main <reason>
+
+- Approval helper: /usr/bin/python3 /home/felixlee/Desktop/aibot/scripts/self_improve_approval_gate.py approve --workspace /home/felixlee/Desktop/aibot --code <CODE> --approver-id <TELEGRAM_USER_ID>

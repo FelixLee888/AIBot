@@ -107,6 +107,12 @@ Generate briefing locally:
 python3 /Users/felixlee/Documents/AIBot/scripts/weather_mountains_briefing.py
 ```
 
+Generate a compact (≤ ~2k chars) briefing for cron/alerts:
+
+```bash
+python3 /Users/felixlee/Documents/AIBot/scripts/weather_mountains_briefing.py --mode compact
+```
+
 Send chunked report to Telegram:
 
 ```bash
