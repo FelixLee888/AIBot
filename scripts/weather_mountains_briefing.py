@@ -9,16 +9,12 @@ Daily run behavior:
 5) Print concise Telegram-ready briefing for tomorrow.
 
 Optional API keys / credentials:
-- METOFFICE_ATMOS_API_KEY (Met Office DataHub atmospheric-models endpoint; falls back to METOFFICE_API_KEY)
-- METOFFICE_ATMOS_ORDER_ID (optional: pin a specific atmospheric orderId)
 - OPENWEATHER_API_KEY (OpenWeather One Call 3.0 / Forecast endpoints)
 - GOOGLE_WEATHER_API_KEY (Google Weather API forecast.days.lookup endpoint)
 - GOOGLE_WEATHER_ACCESS_TOKEN (preferred for Google Weather OAuth2)
 
 Met Office (non-atmospheric) forecast metrics are scraped from public Met Office
 forecast UI pages (no API key required).
-
-Atmospheric GRIB extraction requires Python package `eccodes`.
 """
 
 from __future__ import annotations
@@ -138,6 +134,7 @@ SOURCE_LABELS = {
     SOURCE_OPENWEATHER: "OpenWeather",
     SOURCE_GOOGLE_WEATHER: "Google Weather",
 }
+RETIRED_SOURCES = (SOURCE_MET_OFFICE_ATMOSPHERIC,)
 
 OPENMETEO_FORECAST_BASE = "https://api.open-meteo.com/v1/forecast"
 OPENMETEO_ARCHIVE_BASE = "https://archive-api.open-meteo.com/v1/archive"
@@ -1674,6 +1671,17 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
 
 
+def purge_retired_sources(conn: sqlite3.Connection, sources: Sequence[str]) -> None:
+    src = [str(s).strip() for s in sources if str(s).strip()]
+    if not src:
+        return
+    placeholders = ",".join("?" for _ in src)
+    params = tuple(src)
+    conn.execute(f"DELETE FROM forecasts WHERE source IN ({placeholders})", params)
+    conn.execute(f"DELETE FROM source_scores WHERE source IN ({placeholders})", params)
+    conn.execute(f"DELETE FROM source_weights WHERE source IN ({placeholders})", params)
+
+
 def upsert_forecast(
     conn: sqlite3.Connection,
     run_date: str,
@@ -1738,8 +1746,6 @@ def configured_sources() -> List[str]:
     sources = [SOURCE_OPEN_METEO, SOURCE_MET_NO]
     if METOFFICE_UI_ENABLED:
         sources.append(SOURCE_MET_OFFICE)
-    if METOFFICE_ATMOS_API_KEY:
-        sources.append(SOURCE_MET_OFFICE_ATMOSPHERIC)
     if OPENWEATHER_API_KEY:
         sources.append(SOURCE_OPENWEATHER)
     if GOOGLE_WEATHER_API_KEY or GOOGLE_WEATHER_ACCESS_TOKEN:
@@ -1749,8 +1755,6 @@ def configured_sources() -> List[str]:
 
 def missing_source_keys() -> List[str]:
     missing: List[str] = []
-    if not METOFFICE_ATMOS_API_KEY:
-        missing.append(SOURCE_MET_OFFICE_ATMOSPHERIC)
     if not OPENWEATHER_API_KEY:
         missing.append(SOURCE_OPENWEATHER)
     if not GOOGLE_WEATHER_API_KEY and not GOOGLE_WEATHER_ACCESS_TOKEN:
@@ -1763,7 +1767,6 @@ def capture_forecasts(conn: sqlite3.Connection, run_date: str, target_date: str,
         SOURCE_OPEN_METEO: fetch_open_meteo_forecast,
         SOURCE_MET_NO: fetch_met_no_forecast,
         SOURCE_MET_OFFICE: fetch_met_office_forecast,
-        SOURCE_MET_OFFICE_ATMOSPHERIC: fetch_met_office_atmospheric_forecast,
         SOURCE_OPENWEATHER: fetch_openweather_forecast,
         SOURCE_GOOGLE_WEATHER: fetch_google_weather_forecast,
     }
@@ -2445,7 +2448,6 @@ def build_full_briefing(
 
     for source in missing_sources:
         env_name = {
-            SOURCE_MET_OFFICE_ATMOSPHERIC: "METOFFICE_ATMOS_API_KEY",
             SOURCE_OPENWEATHER: "OPENWEATHER_API_KEY",
             SOURCE_GOOGLE_WEATHER: "GOOGLE_WEATHER_ACCESS_TOKEN",
         }.get(source, "API_KEY")
@@ -2585,6 +2587,7 @@ def main() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         init_db(conn)
+        purge_retired_sources(conn, RETIRED_SOURCES)
 
         capture_forecasts(conn, run_date=run_date, target_date=forecast_date, sources=active_sources)
         capture_actuals(conn, date_str=eval_date)

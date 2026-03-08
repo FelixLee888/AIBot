@@ -22,7 +22,7 @@ flowchart LR
   C --> D["Open-Meteo API"]
   C --> E["OpenWeather API"]
   C --> F["Met Office Forecast UI Crawl"]
-  C --> G["Met Office Atmospheric Models (GRIB)"]
+  C --> G["Met Office Forecast UI Parser"]
   C --> H["MWIS Forecast/PDF Links"]
 
   C --> I["SQLite Benchmark Store<br/>data/weather_benchmark.sqlite3"]
@@ -88,10 +88,6 @@ Put env vars in `.env` (or `~/.openclaw/.env` on Pi).
 - `METOFFICE_UI_ENABLED` (default `1`)
 - `METOFFICE_UI_FORECAST_BASE` (default `https://weather.metoffice.gov.uk/forecast`)
 - `METOFFICE_UI_GEOHASH_PRECISION` (default `9`)
-- `METOFFICE_ATMOS_API_KEY`
-- `METOFFICE_ATMOS_ORDER_ID`
-- `METOFFICE_ATMOS_MAX_FILES`
-- `METOFFICE_ATMOS_MAX_FILE_MB`
 - `OPENWEATHER_API_KEY`
 - `OPENWEATHER_MODE` (default `auto`)
 - `GOOGLE_WEATHER_ACCESS_TOKEN` (preferred)
@@ -99,9 +95,6 @@ Put env vars in `.env` (or `~/.openclaw/.env` on Pi).
 - `GOOGLE_WEATHER_QUOTA_PROJECT` (or `GOOGLE_CLOUD_PROJECT`)
 - `GOOGLE_WEATHER_UNITS_SYSTEM` (default `METRIC`)
 - `GOOGLE_WEATHER_LANGUAGE_CODE` (default `en-GB`)
-
-Notes:
-- `METOFFICE_API_KEY` is optional legacy fallback only for `METOFFICE_ATMOS_API_KEY`.
 
 ## Usage
 
