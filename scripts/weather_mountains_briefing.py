@@ -8,13 +8,15 @@ Daily run behavior:
 4) Recompute source weights for ensemble forecast logic.
 5) Print concise Telegram-ready briefing for tomorrow.
 
-Optional API keys:
-- METOFFICE_API_KEY   (Met Office DataHub site-specific endpoint)
+Optional API keys / credentials:
 - METOFFICE_ATMOS_API_KEY (Met Office DataHub atmospheric-models endpoint; falls back to METOFFICE_API_KEY)
 - METOFFICE_ATMOS_ORDER_ID (optional: pin a specific atmospheric orderId)
 - OPENWEATHER_API_KEY (OpenWeather One Call 3.0 / Forecast endpoints)
 - GOOGLE_WEATHER_API_KEY (Google Weather API forecast.days.lookup endpoint)
 - GOOGLE_WEATHER_ACCESS_TOKEN (preferred for Google Weather OAuth2)
+
+Met Office (non-atmospheric) forecast metrics are scraped from public Met Office
+forecast UI pages (no API key required).
 
 Atmospheric GRIB extraction requires Python package `eccodes`.
 """
@@ -24,6 +26,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import base64
+import html
 import json
 import math
 import os
@@ -104,7 +107,6 @@ MEMORY_ROOT = resolve_memory_root()
 MEMORY_DIR = MEMORY_ROOT / "memory"
 HEARTBEAT_STATE_PATH = MEMORY_DIR / "heartbeat-state.json"
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate Scottish mountain weather briefings in full or compact form.",
@@ -121,7 +123,6 @@ def parse_args() -> argparse.Namespace:
         help="Shortcut for --mode compact",
     )
     return parser.parse_args()
-
 SOURCE_OPEN_METEO = "open_meteo"
 SOURCE_MET_NO = "met_no"
 SOURCE_MET_OFFICE = "met_office"
@@ -191,10 +192,12 @@ def read_int_env(name: str, default: int) -> int:
         return default
 
 
-# Met Office DataHub site-specific (from DataHub docs and examples).
-METOFFICE_BASE = "https://data.hub.api.metoffice.gov.uk/sitespecific/v0/point/three-hourly"
+# Legacy key is still read so existing environments can continue to use it as a
+# fallback for METOFFICE_ATMOS_API_KEY.
 METOFFICE_API_KEY = read_env_value("METOFFICE_API_KEY", "")
-METOFFICE_DATASOURCE = read_env_value("METOFFICE_DATASOURCE", "BD1").strip() or "BD1"
+METOFFICE_UI_FORECAST_BASE = read_env_value("METOFFICE_UI_FORECAST_BASE", "https://weather.metoffice.gov.uk/forecast").strip() or "https://weather.metoffice.gov.uk/forecast"
+METOFFICE_UI_GEOHASH_PRECISION = max(7, min(12, read_int_env("METOFFICE_UI_GEOHASH_PRECISION", 9)))
+METOFFICE_UI_ENABLED = read_env_value("METOFFICE_UI_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 METOFFICE_ATMOSPHERIC_BASE = "https://data.hub.api.metoffice.gov.uk/atmospheric-models/1.0.0"
 METOFFICE_ATMOS_API_KEY = read_env_value("METOFFICE_ATMOS_API_KEY", METOFFICE_API_KEY)
 METOFFICE_ATMOS_ORDER_ID = read_env_value("METOFFICE_ATMOS_ORDER_ID", "").strip()
@@ -393,6 +396,14 @@ def request_json_with_meta(url: str, headers: Optional[Dict[str, str]] = None) -
             if isinstance(raw_msg, str):
                 message = raw_msg
         return status, data if isinstance(data, dict) else None, message
+    except Exception as exc:
+        return None, None, str(exc)
+
+
+def request_text_with_meta(url: str, headers: Optional[Dict[str, str]] = None) -> Tuple[Optional[int], Optional[str], str]:
+    try:
+        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        return resp.status_code, resp.text, ""
     except Exception as exc:
         return None, None, str(exc)
 
@@ -604,117 +615,150 @@ def fetch_met_no_forecast(lat: float, lon: float, target_date: str) -> Dict[str,
 
 
 def fetch_met_office_forecast(lat: float, lon: float, target_date: str) -> Dict[str, Optional[float]]:
-    if not METOFFICE_API_KEY:
+    if not METOFFICE_UI_ENABLED:
         return none_metrics()
 
-    params = {
-        "datasource": METOFFICE_DATASOURCE,
-        "includeLocationName": "true",
-        "excludeParameterMetadata": "true",
-        "latitude": f"{lat:.6f}",
-        "longitude": f"{lon:.6f}",
-    }
-    url = f"{METOFFICE_BASE}?{urlencode(params)}"
-    status, payload, message = request_json_with_meta(url, headers={"apikey": METOFFICE_API_KEY})
+    # Met Office forecast URLs accept geohash-like location IDs. The values
+    # below are generated from target coordinates, then fetched as rendered HTML.
+    geohash_id = geohash_encode(lat, lon, METOFFICE_UI_GEOHASH_PRECISION)
+    if not geohash_id:
+        set_runtime_note_once(SOURCE_MET_OFFICE, "Failed to generate Met Office forecast geohash")
+        return none_metrics()
+
+    base = METOFFICE_UI_FORECAST_BASE.rstrip("/")
+    url = f"{base}/{geohash_id}"
+    status, html_text, message = request_text_with_meta(
+        url,
+        headers={
+            # The weather UI is public web content; send a browser-like UA.
+            "User-Agent": "Mozilla/5.0 (compatible; AIBot-WeatherBenchmark/1.0)",
+        },
+    )
 
     if status is None:
-        set_runtime_note_once(SOURCE_MET_OFFICE, f"Met Office request failed ({message or 'network error'})")
-        return none_metrics()
-
-    if status == 401:
-        set_runtime_note_once(SOURCE_MET_OFFICE, f"Met Office auth failed (HTTP 401: {message or 'missing/invalid apikey header'})")
-        return none_metrics()
-
-    if status == 403:
-        hint = metoffice_subscription_hint(METOFFICE_API_KEY)
-        if hint:
-            set_runtime_note_once(SOURCE_MET_OFFICE, f"Met Office auth failed (HTTP 403: {hint})")
-        else:
-            set_runtime_note_once(SOURCE_MET_OFFICE, f"Met Office auth failed (HTTP 403: {message or 'resource forbidden'})")
+        set_runtime_note_once(SOURCE_MET_OFFICE, f"Met Office UI request failed ({message or 'network error'})")
         return none_metrics()
 
     if status >= 400:
-        set_runtime_note_once(SOURCE_MET_OFFICE, f"Met Office HTTP {status} ({message or 'request failed'})")
+        set_runtime_note_once(SOURCE_MET_OFFICE, f"Met Office UI HTTP {status} ({message or 'request failed'})")
         return none_metrics()
 
-    if not payload:
-        set_runtime_note_once(SOURCE_MET_OFFICE, "Met Office payload unavailable")
+    if not html_text:
+        set_runtime_note_once(SOURCE_MET_OFFICE, "Met Office UI payload unavailable")
         return none_metrics()
 
-    features = payload.get("features", [])
-    if not isinstance(features, list) or not features:
-        set_runtime_note_once(SOURCE_MET_OFFICE, "Met Office response missing features")
+    hourly_table_html = extract_metoffice_hourly_table_for_date(html_text, target_date)
+    if not hourly_table_html:
+        set_runtime_note_once(SOURCE_MET_OFFICE, "Met Office UI missing hourly table for target date")
         return none_metrics()
 
-    props = features[0].get("properties", {}) if isinstance(features[0], dict) else {}
-    series = props.get("timeSeries") or props.get("timeseries") or []
-    if not isinstance(series, list):
-        set_runtime_note_once(SOURCE_MET_OFFICE, "Met Office response missing timeSeries array")
-        return none_metrics()
-
-    temps: List[float] = []
-    winds_mps: List[float] = []
-
-    temp_aliases = [
-        "screenTemperature",
-        "airTemperature",
-        "temperature",
-        "temp",
-        "dayMaxScreenTemperature",
-        "nightMinScreenTemperature",
-    ]
-    wind_aliases = [
-        "windSpeed10m",
-        "windSpeed",
-        "max10mWindSpeed",
-        "windGustSpeed10m",
-        "windGustSpeed",
-        "midday10MWindSpeed",
-    ]
-
-    for item in series:
-        if not isinstance(item, dict):
-            continue
-
-        raw_time = item.get("time")
-        if isinstance(raw_time, str):
-            try:
-                ts = dt.datetime.fromisoformat(raw_time.replace("Z", "+00:00")).astimezone(TZ)
-            except ValueError:
-                continue
-            if ts.date().isoformat() != target_date:
-                continue
-        else:
-            continue
-
-        candidate_objs = [
-            item,
-            item.get("data", {}).get("instant", {}).get("details", {}),
-            item.get("parameters", {}),
-            item.get("details", {}),
-        ]
-
-        t_val = None
-        w_val = None
-        for obj in candidate_objs:
-            if t_val is None:
-                t_val = pick_value_from_obj(obj, temp_aliases, avoid_tokens=("feels", "apparent"))
-            if w_val is None:
-                w_val = pick_value_from_obj(obj, wind_aliases, avoid_tokens=("direction",))
-
-        if t_val is not None:
-            temps.append(t_val)
-        if w_val is not None:
-            winds_mps.append(w_val)
+    temps = extract_metoffice_temperatures_from_hourly_table(hourly_table_html)
+    winds_mph = extract_metoffice_winds_mph_from_hourly_table(hourly_table_html)
 
     metrics = {
         "temp_max": max(temps) if temps else None,
         "temp_min": min(temps) if temps else None,
-        "wind_max": mps_to_kmh(max(winds_mps) if winds_mps else None),
+        "wind_max": mph_to_kmh(max(winds_mph) if winds_mph else None),
     }
     if not has_any_metric(metrics):
-        set_runtime_note_once(SOURCE_MET_OFFICE, "No target-day Met Office metrics found in timeSeries")
+        set_runtime_note_once(SOURCE_MET_OFFICE, "No target-day Met Office metrics found in hourly table")
     return metrics
+
+
+def geohash_encode(lat: float, lon: float, precision: int = 9) -> str:
+    try:
+        lat_v = float(lat)
+        lon_v = float(lon)
+    except Exception:
+        return ""
+
+    if not (-90.0 <= lat_v <= 90.0 and -180.0 <= lon_v <= 180.0):
+        return ""
+
+    alphabet = "0123456789bcdefghjkmnpqrstuvwxyz"
+    bits = [16, 8, 4, 2, 1]
+    lat_range = [-90.0, 90.0]
+    lon_range = [-180.0, 180.0]
+    bit_idx = 0
+    ch = 0
+    even = True
+    out: List[str] = []
+
+    while len(out) < precision:
+        if even:
+            mid = (lon_range[0] + lon_range[1]) / 2.0
+            if lon_v > mid:
+                ch |= bits[bit_idx]
+                lon_range[0] = mid
+            else:
+                lon_range[1] = mid
+        else:
+            mid = (lat_range[0] + lat_range[1]) / 2.0
+            if lat_v > mid:
+                ch |= bits[bit_idx]
+                lat_range[0] = mid
+            else:
+                lat_range[1] = mid
+        even = not even
+        if bit_idx < 4:
+            bit_idx += 1
+        else:
+            out.append(alphabet[ch])
+            bit_idx = 0
+            ch = 0
+    return "".join(out)
+
+
+def strip_html_tags(text: str) -> str:
+    raw = re.sub(r"<[^>]+>", " ", text, flags=re.S)
+    return re.sub(r"\s+", " ", html.unescape(raw)).strip()
+
+
+def extract_metoffice_hourly_table_for_date(html_text: str, target_date: str) -> str:
+    pattern = re.compile(
+        rf"<table\b(?=[^>]*\bclass=\"[^\"]*\bhourly-table\b[^\"]*\")(?=[^>]*\bdata-date=\"{re.escape(target_date)}\")[^>]*>(.*?)</table>",
+        re.I | re.S,
+    )
+    match = pattern.search(html_text)
+    return match.group(1) if match else ""
+
+
+def extract_row_cells_from_table(table_html: str, class_fragment: str) -> List[str]:
+    row_match = re.search(
+        rf"<tr\b[^>]*\bclass=\"[^\"]*{re.escape(class_fragment)}[^\"]*\"[^>]*>(.*?)</tr>",
+        table_html,
+        re.I | re.S,
+    )
+    if not row_match:
+        return []
+    row_html = row_match.group(1)
+    return re.findall(r"<td\b[^>]*>(.*?)</td>", row_html, re.I | re.S)
+
+
+def extract_metoffice_temperatures_from_hourly_table(table_html: str) -> List[float]:
+    values: List[float] = []
+    for cell_html in extract_row_cells_from_table(table_html, "weather-temperature-row"):
+        text = strip_html_tags(cell_html)
+        m = re.search(r"(-?\d+(?:\.\d+)?)\s*°", text)
+        if not m:
+            continue
+        val = to_float(m.group(1))
+        if val is not None:
+            values.append(val)
+    return values
+
+
+def extract_metoffice_winds_mph_from_hourly_table(table_html: str) -> List[float]:
+    values: List[float] = []
+    for cell_html in extract_row_cells_from_table(table_html, "wind-row"):
+        text = strip_html_tags(cell_html)
+        m = re.search(r"(-?\d+(?:\.\d+)?)\s*mph\b", text, re.I)
+        if not m:
+            continue
+        val = to_float(m.group(1))
+        if val is not None:
+            values.append(val)
+    return values
 
 
 def sanitize_filename_fragment(text: str) -> str:
@@ -1692,7 +1736,7 @@ def upsert_actual(conn: sqlite3.Connection, date_str: str, location: Dict, metri
 
 def configured_sources() -> List[str]:
     sources = [SOURCE_OPEN_METEO, SOURCE_MET_NO]
-    if METOFFICE_API_KEY:
+    if METOFFICE_UI_ENABLED:
         sources.append(SOURCE_MET_OFFICE)
     if METOFFICE_ATMOS_API_KEY:
         sources.append(SOURCE_MET_OFFICE_ATMOSPHERIC)
@@ -1705,8 +1749,6 @@ def configured_sources() -> List[str]:
 
 def missing_source_keys() -> List[str]:
     missing: List[str] = []
-    if not METOFFICE_API_KEY:
-        missing.append(SOURCE_MET_OFFICE)
     if not METOFFICE_ATMOS_API_KEY:
         missing.append(SOURCE_MET_OFFICE_ATMOSPHERIC)
     if not OPENWEATHER_API_KEY:
@@ -2403,7 +2445,6 @@ def build_full_briefing(
 
     for source in missing_sources:
         env_name = {
-            SOURCE_MET_OFFICE: "METOFFICE_API_KEY",
             SOURCE_MET_OFFICE_ATMOSPHERIC: "METOFFICE_ATMOS_API_KEY",
             SOURCE_OPENWEATHER: "OPENWEATHER_API_KEY",
             SOURCE_GOOGLE_WEATHER: "GOOGLE_WEATHER_ACCESS_TOKEN",
