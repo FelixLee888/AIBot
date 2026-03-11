@@ -11,6 +11,7 @@ Yuen Yuen Weather Bot generates a daily Scotland mountain briefing, benchmarks f
   - Cairngorms
 - Source benchmarking with rolling confidence
 - Telegram delivery that splits long reports into multiple messages
+- Auto-export of latest report/benchmark/history JSON to YuenYuenWeatherSite
 
 ## Infrastructure Diagram
 
@@ -82,6 +83,14 @@ Put env vars in `.env` (or `~/.openclaw/.env` on Pi).
 - `WEATHER_BENCHMARK_DATA_DIR` (optional data path)
 - `TELEGRAM_BOT_TOKEN` (required for Telegram sender)
 - `WEATHER_TELEGRAM_CHAT_ID` (optional recipient override)
+- `WEATHER_SITE_SYNC_ENABLED` (default `1`, enable JSON export + git publish)
+- `WEATHER_SITE_REPO_PATH` (optional; defaults try Desktop/Documents `YuenYuenWeatherSite`)
+- `WEATHER_SITE_REPO_URL` (default `https://github.com/FelixLee888/YuenYuenWeatherSite.git`)
+- `WEATHER_SITE_GIT_REMOTE` (default `origin`)
+- `WEATHER_SITE_GIT_BRANCH` (default `main`)
+- `WEATHER_SITE_GIT_PUSH_ENABLED` (default `1`; set `0` for commit-only mode)
+- `WEATHER_SITE_DATA_SUBDIR` (default `public/data`)
+- `WEATHER_SITE_HISTORY_DAYS` (default `30`)
 
 ### Forecast Sources / APIs
 
@@ -142,3 +151,9 @@ Main tables:
 - `actuals`
 - `source_scores`
 - `source_weights`
+
+Weather-site JSON artifacts (default path: `YuenYuenWeatherSite/public/data`):
+
+- `weather_latest_report.json`
+- `weather_benchmarks_latest.json`
+- `weather_history_recent.json`

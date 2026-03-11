@@ -28,6 +28,7 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -189,6 +190,13 @@ def read_int_env(name: str, default: int) -> int:
         return default
 
 
+def read_bool_env(name: str, default: bool) -> bool:
+    raw = read_env_value(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "no", "off"}
+
+
 # Legacy key is still read so existing environments can continue to use it as a
 # fallback for METOFFICE_ATMOS_API_KEY.
 METOFFICE_API_KEY = read_env_value("METOFFICE_API_KEY", "")
@@ -224,9 +232,24 @@ RUNTIME_SOURCE_NOTES: Dict[str, str] = {}
 
 LOOKBACK_DAYS = 14
 REQUEST_TIMEOUT = 20
-DEFAULT_NONE_METRICS = {"temp_max": None, "temp_min": None, "wind_max": None}
+DEFAULT_NONE_METRICS = {
+    "temp_max": None,
+    "temp_min": None,
+    "wind_max": None,
+    "rain_chance": None,
+    "wind_dir": None,
+}
 METOFFICE_ATMOS_CACHE: Dict[str, Dict[Tuple[float, float], Dict[str, Optional[float]]]] = {}
 METOFFICE_ATMOS_CACHE_DIR = DATA_DIR / "metoffice_atmos_grib"
+
+WEATHER_SITE_SYNC_ENABLED = read_bool_env("WEATHER_SITE_SYNC_ENABLED", True)
+WEATHER_SITE_REPO_PATH = read_env_value("WEATHER_SITE_REPO_PATH", "").strip()
+WEATHER_SITE_REPO_URL = read_env_value("WEATHER_SITE_REPO_URL", "https://github.com/FelixLee888/YuenYuenWeatherSite.git").strip()
+WEATHER_SITE_GIT_REMOTE = read_env_value("WEATHER_SITE_GIT_REMOTE", "origin").strip() or "origin"
+WEATHER_SITE_GIT_BRANCH = read_env_value("WEATHER_SITE_GIT_BRANCH", "main").strip() or "main"
+WEATHER_SITE_DATA_SUBDIR = read_env_value("WEATHER_SITE_DATA_SUBDIR", "public/data").strip().strip("/") or "public/data"
+WEATHER_SITE_HISTORY_DAYS = max(7, read_int_env("WEATHER_SITE_HISTORY_DAYS", 30))
+WEATHER_SITE_GIT_PUSH_ENABLED = read_bool_env("WEATHER_SITE_GIT_PUSH_ENABLED", True)
 
 
 def london_today() -> dt.date:
@@ -320,6 +343,423 @@ def persist_weather_memory_entry(
     append_daily_memory_note(run_date, lines)
 
 
+def persist_weather_site_sync_note(run_date: str, sync_result: Dict[str, object]) -> None:
+    if not sync_result:
+        return
+    status = memory_clean_text(sync_result.get("status") or "unknown")
+    repo = memory_clean_text(sync_result.get("repo") or "(not found)")
+    files = sync_result.get("changed_files") or sync_result.get("files") or []
+    file_text = ", ".join(memory_clean_text(x) for x in files if memory_clean_text(x)) or "(none)"
+    lines = [
+        f"- [{utc_now_iso()}] weather_site_sync {status}",
+        f"  repo: {repo}",
+        f"  files: {file_text}",
+    ]
+    err = memory_clean_text(sync_result.get("error"))
+    if err:
+        lines.append(f"  error: {err}")
+    append_daily_memory_note(run_date, lines)
+
+
+def resolve_weather_site_repo_dir() -> Optional[Path]:
+    candidates: List[Path] = []
+    if WEATHER_SITE_REPO_PATH:
+        candidates.append(Path(WEATHER_SITE_REPO_PATH))
+    candidates.extend(
+        [
+            Path("/home/felixlee/Desktop/YuenYuenWeatherSite"),
+            Path.home() / "Desktop/YuenYuenWeatherSite",
+            Path.home() / "Documents/YuenYuenWeatherSite",
+            Path("/Users/felixlee/Documents/YuenYuenWeatherSite"),
+        ]
+    )
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if candidate.exists() and (candidate / ".git").exists():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def round_metric(value: Optional[float], ndigits: int = 2) -> Optional[float]:
+    v = to_float(value)
+    if v is None:
+        return None
+    return round(v, ndigits)
+
+
+def json_write_if_changed(path: Path, payload: Dict[str, object]) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
+    try:
+        if path.exists() and path.read_text(encoding="utf-8", errors="ignore") == body:
+            return False
+    except Exception:
+        pass
+    path.write_text(body, encoding="utf-8")
+    return True
+
+
+def run_git(repo_dir: Path, args: Sequence[str]) -> Tuple[int, str, str]:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(repo_dir),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+    except Exception as exc:
+        return 999, "", f"{exc.__class__.__name__}: {exc}"
+
+
+def history_window_start(run_date: str, history_days: int) -> str:
+    try:
+        run_d = dt.date.fromisoformat(run_date)
+    except Exception:
+        run_d = london_today()
+    start_d = run_d - dt.timedelta(days=max(1, history_days) - 1)
+    return iso(start_d)
+
+
+def build_weather_site_history_payload(conn: sqlite3.Connection, run_date: str) -> Dict[str, object]:
+    start_date = history_window_start(run_date, WEATHER_SITE_HISTORY_DAYS)
+
+    score_rows = conn.execute(
+        """
+        SELECT date, source, mae_temp_max, mae_temp_min, mae_wind_max, composite_error, confidence, sample_count
+        FROM source_scores
+        WHERE date >= ?
+        ORDER BY date DESC, source ASC
+        """,
+        (start_date,),
+    ).fetchall()
+
+    weight_rows = conn.execute(
+        """
+        SELECT date, source, weight, rolling_confidence, lookback_days
+        FROM source_weights
+        WHERE date >= ?
+        ORDER BY date DESC, source ASC
+        """,
+        (start_date,),
+    ).fetchall()
+
+    actual_rows = conn.execute(
+        """
+        SELECT date, location, lat, lon, temp_max, temp_min, wind_max
+        FROM actuals
+        WHERE date >= ?
+        ORDER BY date DESC, location ASC
+        """,
+        (start_date,),
+    ).fetchall()
+
+    forecast_rows = conn.execute(
+        """
+        SELECT run_date, target_date, source, location, temp_max, temp_min, wind_max
+        FROM forecasts
+        WHERE run_date >= ?
+        ORDER BY run_date DESC, target_date DESC, source ASC, location ASC
+        """,
+        (start_date,),
+    ).fetchall()
+
+    return {
+        "generated_at_utc": utc_now_iso(),
+        "run_date": run_date,
+        "window_days": WEATHER_SITE_HISTORY_DAYS,
+        "start_date": start_date,
+        "source_scores": [
+            {
+                "date": str(r["date"]),
+                "source": str(r["source"]),
+                "source_label": SOURCE_LABELS.get(str(r["source"]), str(r["source"])),
+                "mae_temp_max": round_metric(r["mae_temp_max"]),
+                "mae_temp_min": round_metric(r["mae_temp_min"]),
+                "mae_wind_max": round_metric(r["mae_wind_max"]),
+                "composite_error": round_metric(r["composite_error"], 4),
+                "confidence": round_metric(r["confidence"], 1),
+                "sample_count": int(r["sample_count"]) if r["sample_count"] is not None else 0,
+            }
+            for r in score_rows
+        ],
+        "source_weights": [
+            {
+                "date": str(r["date"]),
+                "source": str(r["source"]),
+                "source_label": SOURCE_LABELS.get(str(r["source"]), str(r["source"])),
+                "weight": round_metric(r["weight"], 6),
+                "weight_pct": round_metric((to_float(r["weight"]) or 0.0) * 100.0, 2),
+                "rolling_confidence": round_metric(r["rolling_confidence"], 1),
+                "lookback_days": int(r["lookback_days"]) if r["lookback_days"] is not None else 0,
+            }
+            for r in weight_rows
+        ],
+        "actuals": [
+            {
+                "date": str(r["date"]),
+                "location": str(r["location"]),
+                "lat": round_metric(r["lat"], 4),
+                "lon": round_metric(r["lon"], 4),
+                "temp_max": round_metric(r["temp_max"]),
+                "temp_min": round_metric(r["temp_min"]),
+                "wind_max": round_metric(r["wind_max"]),
+            }
+            for r in actual_rows
+        ],
+        "forecasts": [
+            {
+                "run_date": str(r["run_date"]),
+                "target_date": str(r["target_date"]),
+                "source": str(r["source"]),
+                "source_label": SOURCE_LABELS.get(str(r["source"]), str(r["source"])),
+                "location": str(r["location"]),
+                "temp_max": round_metric(r["temp_max"]),
+                "temp_min": round_metric(r["temp_min"]),
+                "wind_max": round_metric(r["wind_max"]),
+            }
+            for r in forecast_rows
+        ],
+    }
+
+
+def build_weather_site_payloads(
+    conn: sqlite3.Connection,
+    mode: str,
+    run_date: str,
+    forecast_date: str,
+    eval_date: str,
+    configured_sources: Sequence[str],
+    available_sources: Sequence[str],
+    skipped_error_sources: Sequence[str],
+    missing_sources: Sequence[str],
+    zone_rows: Dict[str, Dict[str, Optional[float]]],
+    forecasts: Dict[str, Dict[str, Dict[str, Optional[float]]]],
+    rolling: Dict[str, Dict[str, float]],
+    weights: Dict[str, float],
+    eval_results: Dict[str, Dict[str, Optional[float]]],
+    mwis_links: Sequence[str],
+) -> Dict[str, Dict[str, object]]:
+    zones: List[Dict[str, object]] = []
+    report_sources = [s for s in configured_sources if s in available_sources]
+
+    for loc in LOCATIONS:
+        name = loc["name"]
+        row = zone_rows.get(name, {})
+        source_rows = forecasts.get(name, {})
+        suitability = activity_suitability(row.get("temp_min"), row.get("temp_max"), row.get("wind_max"))
+        zones.append(
+            {
+                "name": name,
+                "lat": round_metric(loc["lat"], 4),
+                "lon": round_metric(loc["lon"], 4),
+                "ensemble": {
+                    "temp_min": round_metric(row.get("temp_min")),
+                    "temp_max": round_metric(row.get("temp_max")),
+                    "wind_max": round_metric(row.get("wind_max")),
+                    "rain_chance": round_metric(row.get("rain_chance"), 1),
+                    "wind_dir": round_metric(row.get("wind_dir"), 0),
+                    "wind_dir_cardinal": direction_to_cardinal(row.get("wind_dir")),
+                    "spread_temp": round_metric(row.get("spread_temp")),
+                    "spread_wind": round_metric(row.get("spread_wind")),
+                    "next_7_days": [
+                        {
+                            "date": str(day.get("date")),
+                            "temp_min": round_metric(day.get("temp_min")),
+                            "temp_max": round_metric(day.get("temp_max")),
+                            "wind_max": round_metric(day.get("wind_max")),
+                            "rain_chance": round_metric(day.get("rain_chance"), 1),
+                            "wind_dir": round_metric(day.get("wind_dir"), 0),
+                            "wind_dir_cardinal": direction_to_cardinal(day.get("wind_dir")),
+                        }
+                        for day in (row.get("next_7_days") or [])
+                        if isinstance(day, dict)
+                    ],
+                },
+                "briefing": zone_briefing_line(
+                    name=name,
+                    tmin=row.get("temp_min"),
+                    tmax=row.get("temp_max"),
+                    wind_kmh=row.get("wind_max"),
+                    rain_chance=row.get("rain_chance"),
+                    wind_dir=row.get("wind_dir"),
+                    spread_temp=row.get("spread_temp"),
+                    spread_wind=row.get("spread_wind"),
+                ),
+                "suitability": suitability,
+                "source_forecasts": {
+                    source: {
+                        "source_label": SOURCE_LABELS.get(source, source),
+                        "temp_min": round_metric(metrics.get("temp_min")),
+                        "temp_max": round_metric(metrics.get("temp_max")),
+                        "wind_max": round_metric(metrics.get("wind_max")),
+                        "rain_chance": round_metric(metrics.get("rain_chance"), 1),
+                        "wind_dir": round_metric(metrics.get("wind_dir"), 0),
+                        "wind_dir_cardinal": direction_to_cardinal(metrics.get("wind_dir")),
+                        "next_7_days": [
+                            {
+                                "date": str(day.get("date")),
+                                "temp_min": round_metric(day.get("temp_min")),
+                                "temp_max": round_metric(day.get("temp_max")),
+                                "wind_max": round_metric(day.get("wind_max")),
+                                "rain_chance": round_metric(day.get("rain_chance"), 1),
+                                "wind_dir": round_metric(day.get("wind_dir"), 0),
+                                "wind_dir_cardinal": direction_to_cardinal(day.get("wind_dir")),
+                            }
+                            for day in (metrics.get("next_7_days") or [])
+                            if isinstance(day, dict)
+                        ],
+                    }
+                    for source, metrics in source_rows.items()
+                },
+            }
+        )
+
+    latest_report_payload: Dict[str, object] = {
+        "generated_at_utc": utc_now_iso(),
+        "mode": mode,
+        "run_date": run_date,
+        "forecast_date": forecast_date,
+        "eval_date": eval_date,
+        "lookback_days": LOOKBACK_DAYS,
+        "sources": {
+            "configured": list(configured_sources),
+            "available": list(available_sources),
+            "used_for_report": report_sources,
+            "missing_api_keys": list(missing_sources),
+            "skipped_errors": list(skipped_error_sources),
+        },
+        "zones": zones,
+        "mwis_pdf_links": list(mwis_links),
+    }
+
+    benchmark_payload: Dict[str, object] = {
+        "generated_at_utc": utc_now_iso(),
+        "run_date": run_date,
+        "eval_date": eval_date,
+        "lookback_days": LOOKBACK_DAYS,
+        "sources": [
+            {
+                "source": source,
+                "source_label": SOURCE_LABELS.get(source, source),
+                "is_available": source in available_sources,
+                "is_missing_api_key": source in missing_sources,
+                "is_skipped_error": source in skipped_error_sources,
+                "runtime_note": RUNTIME_SOURCE_NOTES.get(source, ""),
+                "latest_confidence": round_metric((eval_results.get(source) or {}).get("confidence"), 1),
+                "mae_temp_max": round_metric((eval_results.get(source) or {}).get("mae_temp_max")),
+                "mae_temp_min": round_metric((eval_results.get(source) or {}).get("mae_temp_min")),
+                "mae_wind_max": round_metric((eval_results.get(source) or {}).get("mae_wind_max")),
+                "composite_error": round_metric((eval_results.get(source) or {}).get("composite_error"), 4),
+                "sample_count": int(round_metric((eval_results.get(source) or {}).get("sample_count"), 0) or 0),
+                "rolling_confidence": round_metric((rolling.get(source) or {}).get("rolling_confidence"), 1),
+                "rolling_error": round_metric((rolling.get(source) or {}).get("rolling_error"), 4),
+                "rolling_samples": int(round_metric((rolling.get(source) or {}).get("samples"), 0) or 0),
+                "ensemble_weight": round_metric(weights.get(source), 6),
+                "ensemble_weight_pct": round_metric((weights.get(source, 0.0) * 100.0), 2),
+            }
+            for source in configured_sources
+        ],
+    }
+
+    history_payload = build_weather_site_history_payload(conn=conn, run_date=run_date)
+
+    return {
+        "weather_latest_report.json": latest_report_payload,
+        "weather_benchmarks_latest.json": benchmark_payload,
+        "weather_history_recent.json": history_payload,
+    }
+
+
+def publish_weather_site_json(
+    payloads: Dict[str, Dict[str, object]],
+    run_date: str,
+    forecast_date: str,
+) -> Dict[str, object]:
+    result: Dict[str, object] = {
+        "enabled": bool(WEATHER_SITE_SYNC_ENABLED),
+        "status": "disabled",
+        "repo": "",
+        "repo_url": WEATHER_SITE_REPO_URL,
+        "branch": WEATHER_SITE_GIT_BRANCH,
+        "remote": WEATHER_SITE_GIT_REMOTE,
+        "data_subdir": WEATHER_SITE_DATA_SUBDIR,
+        "files": sorted(payloads.keys()),
+        "changed_files": [],
+        "error": "",
+        "push_enabled": bool(WEATHER_SITE_GIT_PUSH_ENABLED),
+    }
+
+    if not WEATHER_SITE_SYNC_ENABLED:
+        return result
+
+    repo_dir = resolve_weather_site_repo_dir()
+    if repo_dir is None:
+        result["status"] = "skipped_repo_not_found"
+        result["error"] = "target repo directory not found; set WEATHER_SITE_REPO_PATH"
+        return result
+
+    result["repo"] = str(repo_dir)
+
+    output_dir = repo_dir / WEATHER_SITE_DATA_SUBDIR
+    rel_paths: List[str] = []
+    changed_files: List[str] = []
+    for filename, payload in payloads.items():
+        rel_path = (Path(WEATHER_SITE_DATA_SUBDIR) / filename).as_posix()
+        target = output_dir / filename
+        changed = json_write_if_changed(target, payload)
+        rel_paths.append(rel_path)
+        if changed:
+            changed_files.append(rel_path)
+    result["files"] = rel_paths
+    result["changed_files"] = changed_files
+
+    add_rc, _, add_err = run_git(repo_dir, ["add", "--", *rel_paths])
+    if add_rc != 0:
+        result["status"] = "failed_git_add"
+        result["error"] = add_err or f"git add failed ({add_rc})"
+        return result
+
+    diff_rc, _, diff_err = run_git(repo_dir, ["diff", "--cached", "--quiet", "--", *rel_paths])
+    if diff_rc == 0:
+        result["status"] = "up_to_date"
+        return result
+    if diff_rc != 1:
+        result["status"] = "failed_git_diff"
+        result["error"] = diff_err or f"git diff failed ({diff_rc})"
+        return result
+
+    commit_msg = f"chore(weather-data): refresh weather JSON for {run_date} -> {forecast_date}"
+    commit_rc, commit_out, commit_err = run_git(repo_dir, ["commit", "-m", commit_msg, "--", *rel_paths])
+    if commit_rc != 0:
+        result["status"] = "failed_git_commit"
+        result["error"] = commit_err or commit_out or f"git commit failed ({commit_rc})"
+        return result
+    result["status"] = "committed"
+
+    if not WEATHER_SITE_GIT_PUSH_ENABLED:
+        return result
+
+    push_rc, push_out, push_err = run_git(
+        repo_dir,
+        ["push", WEATHER_SITE_GIT_REMOTE, f"HEAD:{WEATHER_SITE_GIT_BRANCH}"],
+    )
+    if push_rc != 0:
+        result["status"] = "committed_push_failed"
+        result["error"] = push_err or push_out or f"git push failed ({push_rc})"
+        return result
+    result["status"] = "pushed"
+    return result
+
+
 def to_float(value) -> Optional[float]:
     try:
         if value is None:
@@ -340,11 +780,121 @@ def rounded_coord(lat: float, lon: float) -> Tuple[float, float]:
 
 
 def none_metrics() -> Dict[str, Optional[float]]:
-    return dict(DEFAULT_NONE_METRICS)
+    out = dict(DEFAULT_NONE_METRICS)
+    out["next_7_days"] = []
+    return out
 
 
 def has_any_metric(metrics: Dict[str, Optional[float]]) -> bool:
     return any(metrics.get(k) is not None for k in ("temp_max", "temp_min", "wind_max"))
+
+
+CARDINAL_TO_DEGREES = {
+    "N": 0.0,
+    "NNE": 22.5,
+    "NE": 45.0,
+    "ENE": 67.5,
+    "E": 90.0,
+    "ESE": 112.5,
+    "SE": 135.0,
+    "SSE": 157.5,
+    "S": 180.0,
+    "SSW": 202.5,
+    "SW": 225.0,
+    "WSW": 247.5,
+    "W": 270.0,
+    "WNW": 292.5,
+    "NW": 315.0,
+    "NNW": 337.5,
+}
+CARDINAL_ORDER = list(CARDINAL_TO_DEGREES.keys())
+
+
+def clamp_probability_percent(value) -> Optional[float]:
+    v = to_float(value)
+    if v is None:
+        return None
+    if 0.0 <= v <= 1.0:
+        v *= 100.0
+    return max(0.0, min(100.0, v))
+
+
+def parse_wind_direction_degrees(value) -> Optional[float]:
+    if isinstance(value, str):
+        raw = value.strip().upper()
+        if not raw:
+            return None
+        cardinal = re.sub(r"[^A-Z]", "", raw)
+        if cardinal in CARDINAL_TO_DEGREES:
+            return CARDINAL_TO_DEGREES[cardinal]
+        m = re.search(r"(-?\d+(?:\.\d+)?)", raw)
+        if m:
+            d = to_float(m.group(1))
+            if d is not None:
+                return d % 360.0
+        return None
+    d = to_float(value)
+    if d is None:
+        return None
+    return d % 360.0
+
+
+def direction_to_cardinal(direction_deg: Optional[float]) -> str:
+    d = to_float(direction_deg)
+    if d is None:
+        return "?"
+    idx = int(((d % 360.0) + 11.25) // 22.5) % 16
+    return CARDINAL_ORDER[idx]
+
+
+def mean_direction_deg(values: Iterable[float]) -> Optional[float]:
+    usable = [to_float(v) for v in values]
+    usable = [v for v in usable if v is not None]
+    if not usable:
+        return None
+    sin_sum = sum(math.sin(math.radians(v)) for v in usable)
+    cos_sum = sum(math.cos(math.radians(v)) for v in usable)
+    if abs(sin_sum) < 1e-9 and abs(cos_sum) < 1e-9:
+        return None
+    return (math.degrees(math.atan2(sin_sum, cos_sum)) + 360.0) % 360.0
+
+
+def weighted_direction_deg(values: Dict[str, Optional[float]], weights: Dict[str, float]) -> Optional[float]:
+    usable = [(src, parse_wind_direction_degrees(val)) for src, val in values.items()]
+    usable = [(src, val) for src, val in usable if val is not None]
+    if not usable:
+        return None
+
+    total_w = sum(weights.get(src, 0.0) for src, _ in usable)
+    if total_w <= 0:
+        total_w = float(len(usable))
+        weighted = [(1.0, val) for _, val in usable]
+    else:
+        weighted = [(weights.get(src, 0.0), val) for src, val in usable]
+
+    sin_sum = sum(w * math.sin(math.radians(val)) for w, val in weighted)
+    cos_sum = sum(w * math.cos(math.radians(val)) for w, val in weighted)
+    if abs(sin_sum) < 1e-9 and abs(cos_sum) < 1e-9:
+        return None
+    return (math.degrees(math.atan2(sin_sum, cos_sum)) + 360.0) % 360.0
+
+
+def normalize_daily_forecast_item(
+    date_str: str,
+    temp_max: Optional[float],
+    temp_min: Optional[float],
+    wind_max: Optional[float],
+    rain_chance: Optional[float],
+    wind_dir: Optional[float],
+) -> Dict[str, Optional[float]]:
+    return {
+        "date": str(date_str),
+        "temp_max": to_float(temp_max),
+        "temp_min": to_float(temp_min),
+        "wind_max": to_float(wind_max),
+        "rain_chance": clamp_probability_percent(rain_chance),
+        "wind_dir": parse_wind_direction_degrees(wind_dir),
+    }
 
 
 def mps_to_kmh(value: Optional[float]) -> Optional[float]:
@@ -522,28 +1072,60 @@ def extract_open_meteo_daily(payload: Dict, target_date: str) -> Dict[str, Optio
     times = daily.get("time", []) if isinstance(daily, dict) else []
 
     if target_date not in times:
-        return {"temp_max": None, "temp_min": None, "wind_max": None}
+        out = none_metrics()
+        out["next_7_days"] = extract_open_meteo_next_7_days(payload)
+        return out
 
     idx = times.index(target_date)
-    return {
+    out = {
         "temp_max": value_at(daily.get("temperature_2m_max", []), idx),
         "temp_min": value_at(daily.get("temperature_2m_min", []), idx),
         "wind_max": value_at(daily.get("wind_speed_10m_max", []), idx),
+        "rain_chance": clamp_probability_percent(value_at(daily.get("precipitation_probability_max", []), idx)),
+        "wind_dir": parse_wind_direction_degrees(value_at(daily.get("wind_direction_10m_dominant", []), idx)),
     }
+    out["next_7_days"] = extract_open_meteo_next_7_days(payload)
+    return out
+
+
+def extract_open_meteo_next_7_days(payload: Dict) -> List[Dict[str, Optional[float]]]:
+    daily = payload.get("daily", {}) if isinstance(payload, dict) else {}
+    times = daily.get("time", []) if isinstance(daily, dict) else []
+    if not isinstance(times, list):
+        return []
+
+    out: List[Dict[str, Optional[float]]] = []
+    for idx, date_str in enumerate(times[:7]):
+        if not isinstance(date_str, str):
+            continue
+        out.append(
+            normalize_daily_forecast_item(
+                date_str=date_str,
+                temp_max=value_at(daily.get("temperature_2m_max", []), idx),
+                temp_min=value_at(daily.get("temperature_2m_min", []), idx),
+                wind_max=value_at(daily.get("wind_speed_10m_max", []), idx),
+                rain_chance=value_at(daily.get("precipitation_probability_max", []), idx),
+                wind_dir=value_at(daily.get("wind_direction_10m_dominant", []), idx),
+            )
+        )
+    return out
 
 
 def fetch_open_meteo_forecast(lat: float, lon: float, target_date: str) -> Dict[str, Optional[float]]:
     params = {
         "latitude": lat,
         "longitude": lon,
-        "daily": "temperature_2m_max,temperature_2m_min,wind_speed_10m_max",
-        "forecast_days": 3,
+        "daily": (
+            "temperature_2m_max,temperature_2m_min,wind_speed_10m_max,"
+            "precipitation_probability_max,wind_direction_10m_dominant"
+        ),
+        "forecast_days": 7,
         "timezone": "Europe/London",
     }
     url = f"{OPENMETEO_FORECAST_BASE}?{urlencode(params)}"
     payload = request_json(url)
     if not payload:
-        return {"temp_max": None, "temp_min": None, "wind_max": None}
+        return none_metrics()
     return extract_open_meteo_daily(payload, target_date)
 
 
@@ -559,15 +1141,17 @@ def fetch_open_meteo_actual(lat: float, lon: float, date_str: str) -> Dict[str, 
     url = f"{OPENMETEO_ARCHIVE_BASE}?{urlencode(params)}"
     payload = request_json(url)
     if not payload:
-        return {"temp_max": None, "temp_min": None, "wind_max": None}
-    return extract_open_meteo_daily(payload, date_str)
+        return none_metrics()
+    out = extract_open_meteo_daily(payload, date_str)
+    out["next_7_days"] = []
+    return out
 
 
 def fetch_met_no_forecast(lat: float, lon: float, target_date: str) -> Dict[str, Optional[float]]:
     url = f"{MET_NO_BASE}?lat={lat}&lon={lon}"
     payload = request_json(url, headers={"User-Agent": MET_NO_USER_AGENT})
     if not payload:
-        return {"temp_max": None, "temp_min": None, "wind_max": None}
+        return none_metrics()
 
     timeseries = (
         payload.get("properties", {})
@@ -575,8 +1159,9 @@ def fetch_met_no_forecast(lat: float, lon: float, target_date: str) -> Dict[str,
         if isinstance(payload, dict)
         else []
     )
-    temps: List[float] = []
-    winds_mps: List[float] = []
+    day_buckets: Dict[str, Dict[str, List[float]]] = defaultdict(
+        lambda: {"temps": [], "winds": [], "dirs": [], "rain_prob": []}
+    )
 
     for item in timeseries:
         if not isinstance(item, dict):
@@ -590,25 +1175,63 @@ def fetch_met_no_forecast(lat: float, lon: float, target_date: str) -> Dict[str,
         except ValueError:
             continue
 
-        if ts.date().isoformat() != target_date:
-            continue
-
         details = item.get("data", {}).get("instant", {}).get("details", {})
         if not isinstance(details, dict):
             continue
 
         t = to_float(details.get("air_temperature"))
         w = to_float(details.get("wind_speed"))
-        if t is not None:
-            temps.append(t)
-        if w is not None:
-            winds_mps.append(w)
+        wd = parse_wind_direction_degrees(details.get("wind_from_direction"))
 
-    return {
-        "temp_max": max(temps) if temps else None,
-        "temp_min": min(temps) if temps else None,
-        "wind_max": mps_to_kmh(max(winds_mps) if winds_mps else None),
-    }
+        precip_amount = None
+        rain_detail = (
+            item.get("data", {}).get("next_1_hours", {}).get("details", {})
+            if isinstance(item.get("data", {}).get("next_1_hours"), dict)
+            else {}
+        )
+        if isinstance(rain_detail, dict):
+            precip_amount = to_float(rain_detail.get("precipitation_amount"))
+
+        day_key = ts.date().isoformat()
+        bucket = day_buckets[day_key]
+        if t is not None:
+            bucket["temps"].append(t)
+        if w is not None:
+            bucket["winds"].append(mps_to_kmh(w))
+        if wd is not None:
+            bucket["dirs"].append(wd)
+        if precip_amount is not None:
+            bucket["rain_prob"].append(100.0 if precip_amount > 0.05 else 0.0)
+
+    next_7_days: List[Dict[str, Optional[float]]] = []
+    for date_str in sorted(day_buckets.keys())[:7]:
+        bucket = day_buckets[date_str]
+        next_7_days.append(
+            normalize_daily_forecast_item(
+                date_str=date_str,
+                temp_max=max(bucket["temps"]) if bucket["temps"] else None,
+                temp_min=min(bucket["temps"]) if bucket["temps"] else None,
+                wind_max=max(bucket["winds"]) if bucket["winds"] else None,
+                rain_chance=mean(bucket["rain_prob"]) if bucket["rain_prob"] else None,
+                wind_dir=mean_direction_deg(bucket["dirs"]),
+            )
+        )
+
+    target_day = next((x for x in next_7_days if x.get("date") == target_date), None)
+    if target_day:
+        out = {
+            "temp_max": target_day.get("temp_max"),
+            "temp_min": target_day.get("temp_min"),
+            "wind_max": target_day.get("wind_max"),
+            "rain_chance": target_day.get("rain_chance"),
+            "wind_dir": target_day.get("wind_dir"),
+            "next_7_days": next_7_days,
+        }
+        return out
+
+    out = none_metrics()
+    out["next_7_days"] = next_7_days
+    return out
 
 
 def fetch_met_office_forecast(lat: float, lon: float, target_date: str) -> Dict[str, Optional[float]]:
@@ -644,18 +1267,40 @@ def fetch_met_office_forecast(lat: float, lon: float, target_date: str) -> Dict[
         set_runtime_note_once(SOURCE_MET_OFFICE, "Met Office UI payload unavailable")
         return none_metrics()
 
-    hourly_table_html = extract_metoffice_hourly_table_for_date(html_text, target_date)
-    if not hourly_table_html:
+    hourly_tables = extract_metoffice_hourly_tables_by_date(html_text)
+    hourly_table_html = hourly_tables.get(target_date, "")
+    if not hourly_table_html and target_date not in hourly_tables:
         set_runtime_note_once(SOURCE_MET_OFFICE, "Met Office UI missing hourly table for target date")
-        return none_metrics()
+    temps = extract_metoffice_temperatures_from_hourly_table(hourly_table_html) if hourly_table_html else []
+    winds_mph = extract_metoffice_winds_mph_from_hourly_table(hourly_table_html) if hourly_table_html else []
+    rains = extract_metoffice_rain_chance_from_hourly_table(hourly_table_html) if hourly_table_html else []
+    wind_dirs = extract_metoffice_wind_dirs_from_hourly_table(hourly_table_html) if hourly_table_html else []
 
-    temps = extract_metoffice_temperatures_from_hourly_table(hourly_table_html)
-    winds_mph = extract_metoffice_winds_mph_from_hourly_table(hourly_table_html)
+    next_7_days: List[Dict[str, Optional[float]]] = []
+    for date_str in sorted(hourly_tables.keys())[:7]:
+        table = hourly_tables[date_str]
+        tvals = extract_metoffice_temperatures_from_hourly_table(table)
+        wvals = extract_metoffice_winds_mph_from_hourly_table(table)
+        rvals = extract_metoffice_rain_chance_from_hourly_table(table)
+        dvals = extract_metoffice_wind_dirs_from_hourly_table(table)
+        next_7_days.append(
+            normalize_daily_forecast_item(
+                date_str=date_str,
+                temp_max=max(tvals) if tvals else None,
+                temp_min=min(tvals) if tvals else None,
+                wind_max=mph_to_kmh(max(wvals) if wvals else None),
+                rain_chance=max(rvals) if rvals else None,
+                wind_dir=mean_direction_deg(dvals),
+            )
+        )
 
     metrics = {
         "temp_max": max(temps) if temps else None,
         "temp_min": min(temps) if temps else None,
         "wind_max": mph_to_kmh(max(winds_mph) if winds_mph else None),
+        "rain_chance": max(rains) if rains else None,
+        "wind_dir": mean_direction_deg(wind_dirs),
+        "next_7_days": next_7_days,
     }
     if not has_any_metric(metrics):
         set_runtime_note_once(SOURCE_MET_OFFICE, "No target-day Met Office metrics found in hourly table")
@@ -720,6 +1365,22 @@ def extract_metoffice_hourly_table_for_date(html_text: str, target_date: str) ->
     return match.group(1) if match else ""
 
 
+def extract_metoffice_hourly_tables_by_date(html_text: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    pattern = re.compile(
+        r"<table\b(?=[^>]*\bclass=\"[^\"]*\bhourly-table\b[^\"]*\")(?=[^>]*\bdata-date=\"([^\"]+)\")[^>]*>(.*?)</table>",
+        re.I | re.S,
+    )
+    for match in pattern.finditer(html_text or ""):
+        date_str = str(match.group(1) or "").strip()
+        table_html = str(match.group(2) or "")
+        if not date_str or not table_html:
+            continue
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+            out[date_str] = table_html
+    return out
+
+
 def extract_row_cells_from_table(table_html: str, class_fragment: str) -> List[str]:
     row_match = re.search(
         rf"<tr\b[^>]*\bclass=\"[^\"]*{re.escape(class_fragment)}[^\"]*\"[^>]*>(.*?)</tr>",
@@ -755,6 +1416,50 @@ def extract_metoffice_winds_mph_from_hourly_table(table_html: str) -> List[float
         val = to_float(m.group(1))
         if val is not None:
             values.append(val)
+    return values
+
+
+def extract_metoffice_wind_dirs_from_hourly_table(table_html: str) -> List[float]:
+    values: List[float] = []
+    for cell_html in extract_row_cells_from_table(table_html, "wind-row"):
+        text = strip_html_tags(cell_html)
+        direction = None
+        m_deg = re.search(r"(-?\d+(?:\.\d+)?)\s*°", text)
+        if m_deg:
+            direction = parse_wind_direction_degrees(m_deg.group(1))
+        if direction is None:
+            m_card = re.search(r"\b(N|NNE|NE|ENE|E|ESE|SE|SSE|S|SSW|SW|WSW|W|WNW|NW|NNW)\b", text, re.I)
+            if m_card:
+                direction = parse_wind_direction_degrees(m_card.group(1))
+        if direction is not None:
+            values.append(direction)
+    return values
+
+
+def extract_metoffice_rain_chance_from_hourly_table(table_html: str) -> List[float]:
+    row_classes = (
+        "precipitation-probability-row",
+        "rain-probability-row",
+        "precipitation-row",
+        "chance-of-rain-row",
+        "rain-row",
+        "probability-row",
+    )
+    values: List[float] = []
+    for row_class in row_classes:
+        cells = extract_row_cells_from_table(table_html, row_class)
+        if not cells:
+            continue
+        for cell_html in cells:
+            text = strip_html_tags(cell_html)
+            m = re.search(r"(-?\d+(?:\.\d+)?)\s*%", text)
+            if not m:
+                continue
+            prob = clamp_probability_percent(m.group(1))
+            if prob is not None:
+                values.append(prob)
+        if values:
+            return values
     return values
 
 
@@ -1355,13 +2060,14 @@ def fetch_met_office_atmospheric_forecast(lat: float, lon: float, target_date: s
 
 def fetch_openweather_forecast(lat: float, lon: float, target_date: str) -> Dict[str, Optional[float]]:
     if not OPENWEATHER_API_KEY:
-        return {"temp_max": None, "temp_min": None, "wind_max": None}
+        return none_metrics()
 
     def parse_onecall(payload: Dict) -> Dict[str, Optional[float]]:
         daily = payload.get("daily", []) if isinstance(payload, dict) else []
         if not isinstance(daily, list):
-            return {"temp_max": None, "temp_min": None, "wind_max": None}
+            return none_metrics()
 
+        next_7_days: List[Dict[str, Optional[float]]] = []
         for day in daily:
             if not isinstance(day, dict):
                 continue
@@ -1370,24 +2076,46 @@ def fetch_openweather_forecast(lat: float, lon: float, target_date: str) -> Dict
                 continue
 
             day_date = dt.datetime.fromtimestamp(float(dt_val), tz=dt.timezone.utc).astimezone(TZ).date().isoformat()
-            if day_date != target_date:
-                continue
-
             temp_obj = day.get("temp", {}) if isinstance(day.get("temp"), dict) else {}
             tmax = to_float(temp_obj.get("max"))
             tmin = to_float(temp_obj.get("min"))
-            wind = mps_to_kmh(to_float(day.get("wind_speed")))
-            return {"temp_max": tmax, "temp_min": tmin, "wind_max": wind}
+            wind = mps_to_kmh(to_float(day.get("wind_speed")) or to_float(day.get("wind_gust")))
+            rain_chance = clamp_probability_percent(day.get("pop"))
+            wind_dir = parse_wind_direction_degrees(day.get("wind_deg"))
+            next_7_days.append(
+                normalize_daily_forecast_item(
+                    date_str=day_date,
+                    temp_max=tmax,
+                    temp_min=tmin,
+                    wind_max=wind,
+                    rain_chance=rain_chance,
+                    wind_dir=wind_dir,
+                )
+            )
 
-        return {"temp_max": None, "temp_min": None, "wind_max": None}
+        next_7_days = next_7_days[:7]
+        target = next((x for x in next_7_days if x.get("date") == target_date), None)
+        if target:
+            out = {
+                "temp_max": target.get("temp_max"),
+                "temp_min": target.get("temp_min"),
+                "wind_max": target.get("wind_max"),
+                "rain_chance": target.get("rain_chance"),
+                "wind_dir": target.get("wind_dir"),
+                "next_7_days": next_7_days,
+            }
+            return out
+        out = none_metrics()
+        out["next_7_days"] = next_7_days
+        return out
 
     def parse_forecast_25(payload: Dict) -> Dict[str, Optional[float]]:
         entries = payload.get("list", []) if isinstance(payload, dict) else []
         if not isinstance(entries, list):
-            return {"temp_max": None, "temp_min": None, "wind_max": None}
-
-        temps: List[float] = []
-        winds_mps: List[float] = []
+            return none_metrics()
+        buckets: Dict[str, Dict[str, List[float]]] = defaultdict(
+            lambda: {"temps": [], "winds": [], "dirs": [], "rain_prob": []}
+        )
 
         for entry in entries:
             if not isinstance(entry, dict):
@@ -1405,24 +2133,60 @@ def fetch_openweather_forecast(lat: float, lon: float, target_date: str) -> Dict
                     except ValueError:
                         ts = None
 
-            if ts is None or ts.date().isoformat() != target_date:
+            if ts is None:
                 continue
 
             main = entry.get("main", {}) if isinstance(entry.get("main"), dict) else {}
             wind = entry.get("wind", {}) if isinstance(entry.get("wind"), dict) else {}
+            rain = entry.get("rain", {}) if isinstance(entry.get("rain"), dict) else {}
 
             t = to_float(main.get("temp"))
             w = to_float(wind.get("speed"))
-            if t is not None:
-                temps.append(t)
-            if w is not None:
-                winds_mps.append(w)
+            wd = parse_wind_direction_degrees(wind.get("deg"))
+            pop = clamp_probability_percent(entry.get("pop"))
+            rain_mm = to_float(rain.get("3h"))
+            if pop is None and rain_mm is not None:
+                pop = 100.0 if rain_mm > 0.05 else 0.0
 
-        return {
-            "temp_max": max(temps) if temps else None,
-            "temp_min": min(temps) if temps else None,
-            "wind_max": mps_to_kmh(max(winds_mps) if winds_mps else None),
-        }
+            day_key = ts.date().isoformat()
+            bucket = buckets[day_key]
+            if t is not None:
+                bucket["temps"].append(t)
+            if w is not None:
+                bucket["winds"].append(mps_to_kmh(w))
+            if wd is not None:
+                bucket["dirs"].append(wd)
+            if pop is not None:
+                bucket["rain_prob"].append(pop)
+
+        next_7_days: List[Dict[str, Optional[float]]] = []
+        for date_str in sorted(buckets.keys())[:7]:
+            bucket = buckets[date_str]
+            next_7_days.append(
+                normalize_daily_forecast_item(
+                    date_str=date_str,
+                    temp_max=max(bucket["temps"]) if bucket["temps"] else None,
+                    temp_min=min(bucket["temps"]) if bucket["temps"] else None,
+                    wind_max=max(bucket["winds"]) if bucket["winds"] else None,
+                    rain_chance=max(bucket["rain_prob"]) if bucket["rain_prob"] else None,
+                    wind_dir=mean_direction_deg(bucket["dirs"]),
+                )
+            )
+
+        target = next((x for x in next_7_days if x.get("date") == target_date), None)
+        if target:
+            out = {
+                "temp_max": target.get("temp_max"),
+                "temp_min": target.get("temp_min"),
+                "wind_max": target.get("wind_max"),
+                "rain_chance": target.get("rain_chance"),
+                "wind_dir": target.get("wind_dir"),
+                "next_7_days": next_7_days,
+            }
+            return out
+        out = none_metrics()
+        out["next_7_days"] = next_7_days
+        return out
 
     base_params = {
         "lat": f"{lat:.6f}",
@@ -1461,7 +2225,7 @@ def fetch_openweather_forecast(lat: float, lon: float, target_date: str) -> Dict
     if SOURCE_OPENWEATHER not in RUNTIME_SOURCE_NOTES:
         RUNTIME_SOURCE_NOTES[SOURCE_OPENWEATHER] = "No usable OpenWeather forecast data"
 
-    return {"temp_max": None, "temp_min": None, "wind_max": None}
+    return none_metrics()
 
 
 def google_display_date_to_iso(display_date) -> Optional[str]:
@@ -1523,15 +2287,46 @@ def google_daypart_wind_kmh(daypart_obj) -> Optional[float]:
     return max(candidates) if candidates else None
 
 
+def google_daypart_wind_dir_deg(daypart_obj) -> Optional[float]:
+    if not isinstance(daypart_obj, dict):
+        return None
+    wind_obj = daypart_obj.get("wind", {})
+    if not isinstance(wind_obj, dict):
+        return None
+    for key in ("direction", "windDirection", "directionDegrees", "windDirectionDegrees"):
+        val = parse_wind_direction_degrees(wind_obj.get(key))
+        if val is not None:
+            return val
+    return None
+
+
+def google_daypart_rain_chance(daypart_obj) -> Optional[float]:
+    if not isinstance(daypart_obj, dict):
+        return None
+    val = pick_value_from_obj(
+        daypart_obj,
+        aliases=(
+            "precipitation.probability",
+            "rainProbability",
+            "probabilityOfPrecipitation",
+            "precipitationChance",
+            "chanceOfRain",
+            "pop",
+        ),
+        avoid_tokens=("amount", "mm"),
+    )
+    return clamp_probability_percent(val)
+
+
 def fetch_google_weather_forecast(lat: float, lon: float, target_date: str) -> Dict[str, Optional[float]]:
     if not GOOGLE_WEATHER_API_KEY and not GOOGLE_WEATHER_ACCESS_TOKEN:
-        return {"temp_max": None, "temp_min": None, "wind_max": None}
+        return none_metrics()
 
     params = {
         "location.latitude": f"{lat:.6f}",
         "location.longitude": f"{lon:.6f}",
-        "days": "3",
-        "pageSize": "3",
+        "days": "7",
+        "pageSize": "7",
         "unitsSystem": GOOGLE_WEATHER_UNITS_SYSTEM,
         "languageCode": GOOGLE_WEATHER_LANGUAGE_CODE,
     }
@@ -1557,39 +2352,69 @@ def fetch_google_weather_forecast(lat: float, lon: float, target_date: str) -> D
     if not payload:
         if SOURCE_GOOGLE_WEATHER not in RUNTIME_SOURCE_NOTES:
             RUNTIME_SOURCE_NOTES[SOURCE_GOOGLE_WEATHER] = "Google Weather payload unavailable"
-        return {"temp_max": None, "temp_min": None, "wind_max": None}
+        return none_metrics()
 
     forecast_days = payload.get("forecastDays", [])
     if not isinstance(forecast_days, list):
         if SOURCE_GOOGLE_WEATHER not in RUNTIME_SOURCE_NOTES:
             RUNTIME_SOURCE_NOTES[SOURCE_GOOGLE_WEATHER] = "Google Weather forecastDays missing"
-        return {"temp_max": None, "temp_min": None, "wind_max": None}
+        return none_metrics()
 
+    next_7_days: List[Dict[str, Optional[float]]] = []
     for day in forecast_days:
         if not isinstance(day, dict):
             continue
-        if google_display_date_to_iso(day.get("displayDate")) != target_date:
+        date_str = google_display_date_to_iso(day.get("displayDate"))
+        if not date_str:
             continue
 
         temp_max = google_temperature_c(day.get("maxTemperature"))
         temp_min = google_temperature_c(day.get("minTemperature"))
         winds: List[float] = []
+        dirs: List[float] = []
+        rains: List[float] = []
         for part_key in ("daytimeForecast", "nighttimeForecast"):
-            w = google_daypart_wind_kmh(day.get(part_key))
+            part_obj = day.get(part_key)
+            w = google_daypart_wind_kmh(part_obj)
             if w is not None:
                 winds.append(w)
+            d = google_daypart_wind_dir_deg(part_obj)
+            if d is not None:
+                dirs.append(d)
+            r = google_daypart_rain_chance(part_obj)
+            if r is not None:
+                rains.append(r)
 
+        next_7_days.append(
+            normalize_daily_forecast_item(
+                date_str=date_str,
+                temp_max=temp_max,
+                temp_min=temp_min,
+                wind_max=max(winds) if winds else None,
+                rain_chance=max(rains) if rains else None,
+                wind_dir=mean_direction_deg(dirs),
+            )
+        )
+
+    next_7_days = next_7_days[:7]
+    target = next((x for x in next_7_days if x.get("date") == target_date), None)
+    if target:
         metrics = {
-            "temp_max": temp_max,
-            "temp_min": temp_min,
-            "wind_max": max(winds) if winds else None,
+            "temp_max": target.get("temp_max"),
+            "temp_min": target.get("temp_min"),
+            "wind_max": target.get("wind_max"),
+            "rain_chance": target.get("rain_chance"),
+            "wind_dir": target.get("wind_dir"),
+            "next_7_days": next_7_days,
         }
         if has_any_metric(metrics):
             return metrics
 
     if SOURCE_GOOGLE_WEATHER not in RUNTIME_SOURCE_NOTES:
         RUNTIME_SOURCE_NOTES[SOURCE_GOOGLE_WEATHER] = "No target-day data in Google Weather response"
-    return {"temp_max": None, "temp_min": None, "wind_max": None}
+    out = none_metrics()
+    out["next_7_days"] = next_7_days
+    return out
 
 
 def fetch_mwis_latest_pdf_links(limit: int = 5) -> List[str]:
@@ -1762,7 +2587,12 @@ def missing_source_keys() -> List[str]:
     return missing
 
 
-def capture_forecasts(conn: sqlite3.Connection, run_date: str, target_date: str, sources: Sequence[str]) -> None:
+def capture_forecasts(
+    conn: sqlite3.Connection,
+    run_date: str,
+    target_date: str,
+    sources: Sequence[str],
+) -> Dict[str, Dict[str, Dict[str, object]]]:
     fetchers = {
         SOURCE_OPEN_METEO: fetch_open_meteo_forecast,
         SOURCE_MET_NO: fetch_met_no_forecast,
@@ -1770,6 +2600,7 @@ def capture_forecasts(conn: sqlite3.Connection, run_date: str, target_date: str,
         SOURCE_OPENWEATHER: fetch_openweather_forecast,
         SOURCE_GOOGLE_WEATHER: fetch_google_weather_forecast,
     }
+    captured: Dict[str, Dict[str, Dict[str, object]]] = defaultdict(dict)
 
     for loc in LOCATIONS:
         for source in sources:
@@ -1785,8 +2616,10 @@ def capture_forecasts(conn: sqlite3.Connection, run_date: str, target_date: str,
             if not isinstance(metrics, dict):
                 set_runtime_note_once(source, "fetcher returned invalid payload")
                 continue
+            captured[loc["name"]][source] = dict(metrics)
             if has_any_metric(metrics):
                 upsert_forecast(conn, run_date, target_date, source, loc, metrics)
+    return captured
 
 
 def capture_actuals(conn: sqlite3.Connection, date_str: str) -> None:
@@ -2076,7 +2909,89 @@ def latest_forecasts_by_location(
             "temp_max": to_float(r["temp_max"]),
             "temp_min": to_float(r["temp_min"]),
             "wind_max": to_float(r["wind_max"]),
+            "rain_chance": None,
+            "wind_dir": None,
+            "next_7_days": [],
         }
+    return out
+
+
+def merge_live_forecast_extras(
+    db_forecasts: Dict[str, Dict[str, Dict[str, object]]],
+    live_forecasts: Dict[str, Dict[str, Dict[str, object]]],
+) -> None:
+    for location, by_source in live_forecasts.items():
+        loc_bucket = db_forecasts.setdefault(location, {})
+        for source, metrics in by_source.items():
+            src_bucket = loc_bucket.setdefault(source, {})
+            if "rain_chance" in metrics:
+                src_bucket["rain_chance"] = clamp_probability_percent(metrics.get("rain_chance"))
+            if "wind_dir" in metrics:
+                src_bucket["wind_dir"] = parse_wind_direction_degrees(metrics.get("wind_dir"))
+
+            daily_in = metrics.get("next_7_days")
+            if isinstance(daily_in, list):
+                daily_out: List[Dict[str, Optional[float]]] = []
+                for item in daily_in[:7]:
+                    if not isinstance(item, dict):
+                        continue
+                    date_str = str(item.get("date") or "").strip()
+                    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+                        continue
+                    daily_out.append(
+                        normalize_daily_forecast_item(
+                            date_str=date_str,
+                            temp_max=to_float(item.get("temp_max")),
+                            temp_min=to_float(item.get("temp_min")),
+                            wind_max=to_float(item.get("wind_max")),
+                            rain_chance=to_float(item.get("rain_chance")),
+                            wind_dir=item.get("wind_dir"),
+                        )
+                    )
+                src_bucket["next_7_days"] = daily_out
+
+
+def aggregate_next_7_days(
+    by_source: Dict[str, object],
+    weights: Dict[str, float],
+) -> List[Dict[str, Optional[float]]]:
+    daily_by_date: Dict[str, Dict[str, Dict[str, Optional[float]]]] = defaultdict(dict)
+    for source, raw_days in by_source.items():
+        if not isinstance(raw_days, list):
+            continue
+        for item in raw_days[:7]:
+            if not isinstance(item, dict):
+                continue
+            date_str = str(item.get("date") or "").strip()
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+                continue
+            daily_by_date[date_str][source] = {
+                "temp_max": to_float(item.get("temp_max")),
+                "temp_min": to_float(item.get("temp_min")),
+                "wind_max": to_float(item.get("wind_max")),
+                "rain_chance": clamp_probability_percent(item.get("rain_chance")),
+                "wind_dir": parse_wind_direction_degrees(item.get("wind_dir")),
+            }
+
+    out: List[Dict[str, Optional[float]]] = []
+    for date_str in sorted(daily_by_date.keys())[:7]:
+        values = daily_by_date[date_str]
+        temp_max_by_source = {src: row.get("temp_max") for src, row in values.items()}
+        temp_min_by_source = {src: row.get("temp_min") for src, row in values.items()}
+        wind_max_by_source = {src: row.get("wind_max") for src, row in values.items()}
+        rain_by_source = {src: row.get("rain_chance") for src, row in values.items()}
+        wind_dir_by_source = {src: row.get("wind_dir") for src, row in values.items()}
+
+        out.append(
+            normalize_daily_forecast_item(
+                date_str=date_str,
+                temp_max=weighted_metric(temp_max_by_source, weights),
+                temp_min=weighted_metric(temp_min_by_source, weights),
+                wind_max=weighted_metric(wind_max_by_source, weights),
+                rain_chance=weighted_metric(rain_by_source, weights),
+                wind_dir=weighted_direction_deg(wind_dir_by_source, weights),
+            )
+        )
     return out
 
 
@@ -2161,15 +3076,23 @@ def zone_briefing_line(
     tmin: Optional[float],
     tmax: Optional[float],
     wind_kmh: Optional[float],
+    rain_chance: Optional[float],
+    wind_dir: Optional[float],
     spread_temp: Optional[float],
     spread_wind: Optional[float],
 ) -> str:
-    if tmin is None and tmax is None and wind_kmh is None:
+    if tmin is None and tmax is None and wind_kmh is None and rain_chance is None:
         return f"- {name}: forecast unavailable from current source set."
 
     temp_part = f"{fmt(tmin)} -> {fmt(tmax)} C"
     wind_part = f"{fmt(wind_kmh)} km/h ({fmt(kmh_to_mph(wind_kmh))} mph)"
     wind_desc = wind_band(wind_kmh)
+    wind_dir_part = ""
+    if wind_dir is not None:
+        wind_dir_part = f" from {direction_to_cardinal(wind_dir)} ({fmt(wind_dir, 0)}°)"
+    rain_part = ""
+    if rain_chance is not None:
+        rain_part = f" Rain chance around {fmt(rain_chance, 0)}%."
 
     stability_notes: List[str] = []
     if spread_temp is not None and spread_temp >= 4:
@@ -2184,8 +3107,8 @@ def zone_briefing_line(
     freezing_suffix = f" {freezing_line}" if freezing_line else ""
 
     return (
-        f"- {name} - {temp_part}. {wind_desc}, peaking near {wind_part}{stability_text}. "
-        f"{best_window_from_conditions(tmin, tmax, wind_kmh)}.{freezing_suffix}"
+        f"- {name} - {temp_part}. {wind_desc}{wind_dir_part}, peaking near {wind_part}{stability_text}. "
+        f"{best_window_from_conditions(tmin, tmax, wind_kmh)}.{freezing_suffix}{rain_part}"
     )
 
 
@@ -2331,9 +3254,39 @@ def rating_initial(label: str) -> str:
     return (label[:1] if label else "?").upper()
 
 
+def summarize_next_7_days(days_obj) -> str:
+    if not isinstance(days_obj, list):
+        return "7-day forecast unavailable."
+    days = [d for d in days_obj if isinstance(d, dict) and isinstance(d.get("date"), str)]
+    if not days:
+        return "7-day forecast unavailable."
+
+    temps_max = [to_float(d.get("temp_max")) for d in days if to_float(d.get("temp_max")) is not None]
+    temps_min = [to_float(d.get("temp_min")) for d in days if to_float(d.get("temp_min")) is not None]
+    winds = [to_float(d.get("wind_max")) for d in days if to_float(d.get("wind_max")) is not None]
+    rains = [to_float(d.get("rain_chance")) for d in days if to_float(d.get("rain_chance")) is not None]
+    dirs = [to_float(d.get("wind_dir")) for d in days if to_float(d.get("wind_dir")) is not None]
+
+    start_date = str(days[0].get("date"))
+    end_date = str(days[min(len(days), 7) - 1].get("date"))
+    span = f"{start_date} -> {end_date}"
+    temp_text = (
+        f"Tmax {fmt(max(temps_max))}C, Tmin {fmt(min(temps_min))}C"
+        if temps_max and temps_min
+        else "temperature range unavailable"
+    )
+    wind_text = (
+        f"peak wind {fmt(max(winds))} km/h from {direction_to_cardinal(mean_direction_deg(dirs))}"
+        if winds
+        else "wind trend unavailable"
+    )
+    rain_text = f"rain chance up to {fmt(max(rains), 0)}%" if rains else "rain chance unavailable"
+    return f"{span} | {temp_text}, {wind_text}, {rain_text}."
+
+
 def compute_zone_rows(
     available_sources: Sequence[str],
-    forecasts: Dict[str, Dict[str, Dict[str, Optional[float]]]],
+    forecasts: Dict[str, Dict[str, Dict[str, object]]],
     weights: Dict[str, float],
 ) -> Dict[str, Dict[str, Optional[float]]]:
     zone_rows: Dict[str, Dict[str, Optional[float]]] = {}
@@ -2350,17 +3303,26 @@ def compute_zone_rows(
         tmax_by_source = {s: source_rows.get(s, {}).get("temp_max") for s in source_keys}
         tmin_by_source = {s: source_rows.get(s, {}).get("temp_min") for s in source_keys}
         wind_by_source = {s: source_rows.get(s, {}).get("wind_max") for s in source_keys}
+        rain_by_source = {s: source_rows.get(s, {}).get("rain_chance") for s in source_keys}
+        wind_dir_by_source = {s: source_rows.get(s, {}).get("wind_dir") for s in source_keys}
+        next7_by_source = {s: source_rows.get(s, {}).get("next_7_days") for s in source_keys}
 
         tmax = weighted_metric(tmax_by_source, weights)
         tmin = weighted_metric(tmin_by_source, weights)
         wind = weighted_metric(wind_by_source, weights)
+        rain = weighted_metric(rain_by_source, weights)
+        wind_dir = weighted_direction_deg(wind_dir_by_source, weights)
+        next_7_days = aggregate_next_7_days(next7_by_source, weights)
 
         zone_rows[name] = {
             "temp_max": tmax,
             "temp_min": tmin,
             "wind_max": wind,
+            "rain_chance": rain,
+            "wind_dir": wind_dir,
             "spread_temp": spread(tmax_by_source),
             "spread_wind": spread(wind_by_source),
+            "next_7_days": next_7_days,
         }
 
     return zone_rows
@@ -2397,10 +3359,13 @@ def build_full_briefing(
                 row.get("temp_min"),
                 row.get("temp_max"),
                 row.get("wind_max"),
+                row.get("rain_chance"),
+                row.get("wind_dir"),
                 row.get("spread_temp"),
                 row.get("spread_wind"),
             )
         )
+        lines.append(f"  7-day: {summarize_next_7_days(row.get('next_7_days'))}")
 
     lines.append("")
     lines.append(f"2) Latest benchmark ({eval_date})")
@@ -2484,13 +3449,15 @@ def build_compact_briefing(
     lines.append("Compact daily snapshot; run `--mode full` for the detailed 5-section report.")
     lines.append("")
 
-    lines.append("Zone snapshot (min→max °C, peak wind km/h):")
+    lines.append("Zone snapshot (min→max °C, peak wind km/h, rain %, wind dir):")
     for loc in LOCATIONS:
         name = loc["name"]
         row = zone_rows.get(name, {})
         tmin = row.get("temp_min")
         tmax = row.get("temp_max")
         wind = row.get("wind_max")
+        rain = row.get("rain_chance")
+        wind_dir = row.get("wind_dir")
         window = concise_best_window(tmin, tmax, wind)
         freeze_short = freeze_condition_phrase(tmin, tmax, short=True)
         spread_flags: List[str] = []
@@ -2500,10 +3467,19 @@ def build_compact_briefing(
             spread_flags.append("wind spread high")
         extras = "; ".join(flag for flag in [freeze_short, *spread_flags] if flag)
         extras_text = f" | {extras}" if extras else ""
+        dir_text = direction_to_cardinal(wind_dir) if wind_dir is not None else "?"
         lines.append(
-            f"- {name}: {fmt(tmin)}→{fmt(tmax)}°C, {fmt(wind)} km/h ({wind_band(wind)}). "
+            f"- {name}: {fmt(tmin)}→{fmt(tmax)}°C, {fmt(wind)} km/h ({wind_band(wind)}), "
+            f"rain {fmt(rain, 0)}%, dir {dir_text}. "
             f"Window {window}{extras_text}"
         )
+
+    lines.append("")
+    lines.append("7-day outlook (ensemble):")
+    for loc in LOCATIONS:
+        name = loc["name"]
+        row = zone_rows.get(name, {})
+        lines.append(f"- {name}: {summarize_next_7_days(row.get('next_7_days'))}")
 
     lines.append("")
     lines.append("Activities (Cycling/Hiking/Skiing ratings):")
@@ -2589,7 +3565,7 @@ def main() -> None:
         init_db(conn)
         purge_retired_sources(conn, RETIRED_SOURCES)
 
-        capture_forecasts(conn, run_date=run_date, target_date=forecast_date, sources=active_sources)
+        live_forecasts = capture_forecasts(conn, run_date=run_date, target_date=forecast_date, sources=active_sources)
         capture_actuals(conn, date_str=eval_date)
         available_sources = available_sources_for_target(conn, target_date=forecast_date, sources=active_sources)
         skipped_error_sources = [s for s in active_sources if s not in available_sources and s in RUNTIME_SOURCE_NOTES]
@@ -2601,6 +3577,7 @@ def main() -> None:
         store_weights(conn, date_str=run_date, weights=weights, rolling=rolling, lookback_days=LOOKBACK_DAYS)
 
         forecasts = latest_forecasts_by_location(conn, target_date=forecast_date, sources=available_sources)
+        merge_live_forecast_extras(forecasts, live_forecasts)
         zone_rows = compute_zone_rows(available_sources=available_sources, forecasts=forecasts, weights=weights)
         mwis_links = fetch_mwis_latest_pdf_links(limit=5)
 
@@ -2633,6 +3610,39 @@ def main() -> None:
                 mwis_links=mwis_links,
             )
 
+        try:
+            weather_site_payloads = build_weather_site_payloads(
+                conn=conn,
+                mode=mode,
+                run_date=run_date,
+                forecast_date=forecast_date,
+                eval_date=eval_date,
+                configured_sources=active_sources,
+                available_sources=available_sources,
+                skipped_error_sources=skipped_error_sources,
+                missing_sources=missing_sources,
+                zone_rows=zone_rows,
+                forecasts=forecasts,
+                rolling=rolling,
+                weights=weights,
+                eval_results=eval_results,
+                mwis_links=mwis_links,
+            )
+            weather_site_sync = publish_weather_site_json(
+                payloads=weather_site_payloads,
+                run_date=run_date,
+                forecast_date=forecast_date,
+            )
+        except Exception as exc:
+            weather_site_sync = {
+                "enabled": bool(WEATHER_SITE_SYNC_ENABLED),
+                "status": "failed_exception",
+                "repo": str(resolve_weather_site_repo_dir() or ""),
+                "files": [],
+                "changed_files": [],
+                "error": f"{exc.__class__.__name__}: {exc}",
+            }
+
         persist_weather_memory_entry(
             run_date=run_date,
             forecast_date=forecast_date,
@@ -2642,6 +3652,7 @@ def main() -> None:
             missing_sources=missing_sources,
             skipped_error_sources=skipped_error_sources,
         )
+        persist_weather_site_sync_note(run_date=run_date, sync_result=weather_site_sync)
         update_heartbeat_state(
             "weather_briefing",
             "ok",
@@ -2654,6 +3665,10 @@ def main() -> None:
                 "missing_source_count": len(missing_sources),
                 "skipped_error_source_count": len(skipped_error_sources),
                 "db_path": str(DB_PATH),
+                "weather_site_sync_status": weather_site_sync.get("status"),
+                "weather_site_repo": weather_site_sync.get("repo"),
+                "weather_site_changed_files": len(weather_site_sync.get("changed_files") or []),
+                "weather_site_sync_error": weather_site_sync.get("error"),
             },
         )
         print(briefing)
