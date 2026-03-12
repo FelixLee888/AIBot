@@ -83,6 +83,9 @@ Put env vars in `.env` (or `~/.openclaw/.env` on Pi).
 - `WEATHER_BENCHMARK_DATA_DIR` (optional data path)
 - `TELEGRAM_BOT_TOKEN` (required for Telegram sender)
 - `WEATHER_TELEGRAM_CHAT_ID` (optional recipient override)
+- `GOOGLE_SHEETS_SPREADSHEET_ID` (watchlist sheet id; preferred)
+- `GOOGLE_SHEETS_WATCHLIST_WORKSHEET` (default `weather_watchlist`)
+- `GOOGLE_OAUTH_ACCESS_TOKEN` or `GOOGLE_SHEETS_ACCESS_TOKEN` (required for watchlist write)
 - `WEATHER_SITE_SYNC_ENABLED` (default `1`, enable JSON export + git publish)
 - `WEATHER_SITE_REPO_PATH` (optional; defaults try Desktop/Documents `YuenYuenWeatherSite`)
 - `WEATHER_SITE_REPO_URL` (default `https://github.com/FelixLee888/YuenYuenWeatherSite.git`)
@@ -124,6 +127,15 @@ Send chunked report to Telegram:
 ```bash
 python3 /Users/felixlee/Documents/AIBot/scripts/send_weather_telegram.py
 ```
+
+Add city to watchlist Google Sheet (used by next forecast run):
+
+```bash
+python3 /Users/felixlee/Documents/AIBot/scripts/weather_mountains_briefing.py --add-city "Aberdeen" --city-country GB
+```
+
+If city name is ambiguous (for example `Cambridge`), the command will ask for
+country and show ISO2 options. Retry with `--city-country`.
 
 ## OpenClaw Cron Example
 

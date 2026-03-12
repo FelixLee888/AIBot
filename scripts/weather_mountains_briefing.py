@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import base64
+import csv
 import html
 import json
 import math
@@ -30,6 +31,7 @@ import re
 import sqlite3
 import subprocess
 from collections import defaultdict
+from io import StringIO
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote, urlencode
@@ -37,12 +39,13 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-LOCATIONS = [
+DEFAULT_LOCATIONS = [
     {"name": "Glencoe", "lat": 56.68, "lon": -5.10},
     {"name": "Ben Nevis", "lat": 56.7969, "lon": -5.0036},
     {"name": "Glenshee", "lat": 56.8526, "lon": -3.4258},
     {"name": "Cairngorms", "lat": 57.1, "lon": -3.7},
 ]
+LOCATIONS = [dict(loc) for loc in DEFAULT_LOCATIONS]
 
 TZ = ZoneInfo("Europe/London")
 
@@ -119,6 +122,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Shortcut for --mode compact",
     )
+    parser.add_argument(
+        "--add-city",
+        default="",
+        help="Add a city/location into Google Sheet weather_watchlist and exit.",
+    )
+    parser.add_argument(
+        "--city-country",
+        default="",
+        help="Optional ISO-2 country code used for geocoding (e.g., GB).",
+    )
     return parser.parse_args()
 SOURCE_OPEN_METEO = "open_meteo"
 SOURCE_MET_NO = "met_no"
@@ -146,8 +159,12 @@ ENV_FALLBACK_FILES = [
     Path(__file__).resolve().parent.parent / ".env",
     Path("/home/felixlee/.openclaw/.env"),
     Path("/home/felixlee/Desktop/aibot/.env"),
+    Path("/home/felixlee/Desktop/YuenYuenWeatherSite/.env"),
+    Path("/home/felixlee/Desktop/chief-fafa/.env"),
     Path.home() / ".openclaw/.env",
     Path.home() / "Desktop/aibot/.env",
+    Path.home() / "Desktop/YuenYuenWeatherSite/.env",
+    Path.home() / "Desktop/chief-fafa/.env",
 ]
 
 
@@ -228,6 +245,24 @@ GOOGLE_WEATHER_QUOTA_PROJECT = (
     or read_env_value("GOOGLE_PROJECT_ID", "")
 )
 
+WATCHLIST_SPREADSHEET_URL_DEFAULT = "https://docs.google.com/spreadsheets/d/1g9_1I1xyt7iO922yNXckPswnqV5ATIzLo3NQ6IJ4O5k/edit?usp=sharing"
+WATCHLIST_SPREADSHEET_URL = read_env_value("WEATHER_WATCHLIST_SPREADSHEET_URL", WATCHLIST_SPREADSHEET_URL_DEFAULT).strip() or WATCHLIST_SPREADSHEET_URL_DEFAULT
+WATCHLIST_SPREADSHEET_ID = (
+    read_env_value("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
+    or read_env_value("WEATHER_WATCHLIST_SPREADSHEET_ID", "").strip()
+)
+WATCHLIST_WORKSHEET = (
+    read_env_value("GOOGLE_SHEETS_WATCHLIST_WORKSHEET", "").strip()
+    or read_env_value("WEATHER_WATCHLIST_WORKSHEET", "weather_watchlist").strip()
+    or "weather_watchlist"
+)
+GOOGLE_SHEETS_API_KEY = read_env_value("GOOGLE_SHEETS_API_KEY", "").strip()
+GOOGLE_SHEETS_ACCESS_TOKEN = (
+    read_env_value("GOOGLE_OAUTH_ACCESS_TOKEN", "").strip()
+    or read_env_value("GOOGLE_SHEETS_ACCESS_TOKEN", "").strip()
+)
+OPENMETEO_GEOCODING_BASE = "https://geocoding-api.open-meteo.com/v1/search"
+
 RUNTIME_SOURCE_NOTES: Dict[str, str] = {}
 
 LOOKBACK_DAYS = 14
@@ -250,6 +285,530 @@ WEATHER_SITE_GIT_BRANCH = read_env_value("WEATHER_SITE_GIT_BRANCH", "main").stri
 WEATHER_SITE_DATA_SUBDIR = read_env_value("WEATHER_SITE_DATA_SUBDIR", "public/data").strip().strip("/") or "public/data"
 WEATHER_SITE_HISTORY_DAYS = max(7, read_int_env("WEATHER_SITE_HISTORY_DAYS", 30))
 WEATHER_SITE_GIT_PUSH_ENABLED = read_bool_env("WEATHER_SITE_GIT_PUSH_ENABLED", True)
+
+
+def extract_google_sheet_id(sheet_url: str) -> str:
+    text = str(sheet_url or "").strip()
+    if not text:
+        return ""
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", text)
+    return m.group(1) if m else ""
+
+
+def parse_bool_cell(value: object, default: bool = True) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def parse_header_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def watchlist_sheet_id() -> str:
+    explicit = WATCHLIST_SPREADSHEET_ID.strip()
+    if explicit:
+        return explicit
+    from_url = extract_google_sheet_id(WATCHLIST_SPREADSHEET_URL)
+    if from_url:
+        return from_url
+    return extract_google_sheet_id(WATCHLIST_SPREADSHEET_URL_DEFAULT)
+
+
+def parse_watchlist_csv_rows(text: str) -> List[List[str]]:
+    if not text:
+        return []
+    rows: List[List[str]] = []
+    reader = csv.reader(StringIO(text))
+    for row in reader:
+        rows.append([str(cell or "").strip() for cell in row])
+    return rows
+
+
+def fetch_watchlist_rows_from_sheets_api(spreadsheet_id: str, worksheet: str) -> List[List[str]]:
+    if not spreadsheet_id:
+        return []
+    if not GOOGLE_SHEETS_API_KEY and not GOOGLE_SHEETS_ACCESS_TOKEN:
+        return []
+
+    range_name = f"{worksheet}!A:Z"
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{quote(range_name, safe='!')}"
+    headers: Dict[str, str] = {}
+    params: Dict[str, str] = {}
+    if GOOGLE_SHEETS_ACCESS_TOKEN:
+        headers["Authorization"] = f"Bearer {GOOGLE_SHEETS_ACCESS_TOKEN}"
+    if GOOGLE_SHEETS_API_KEY:
+        params["key"] = GOOGLE_SHEETS_API_KEY
+    resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+    if resp.status_code >= 400:
+        return []
+    payload = resp.json() if resp.content else {}
+    values = payload.get("values")
+    if not isinstance(values, list):
+        return []
+
+    out: List[List[str]] = []
+    for row in values:
+        if not isinstance(row, list):
+            continue
+        out.append([str(cell or "").strip() for cell in row])
+    return out
+
+
+def fetch_watchlist_rows_from_public_csv(spreadsheet_id: str, worksheet: str) -> List[List[str]]:
+    if not spreadsheet_id:
+        return []
+    urls = [
+        f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={quote(worksheet)}",
+        f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv&sheet={quote(worksheet)}",
+    ]
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+        except Exception:
+            continue
+        if resp.status_code >= 400:
+            continue
+        rows = parse_watchlist_csv_rows(resp.text)
+        if rows:
+            return rows
+    return []
+
+
+def fetch_watchlist_rows() -> List[List[str]]:
+    spreadsheet_id = watchlist_sheet_id()
+    worksheet = WATCHLIST_WORKSHEET
+    rows = fetch_watchlist_rows_from_sheets_api(spreadsheet_id, worksheet)
+    if rows:
+        return rows
+    return fetch_watchlist_rows_from_public_csv(spreadsheet_id, worksheet)
+
+
+def parse_google_api_error(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {}
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            msg = str(err.get("message") or "").strip()
+            if msg:
+                return msg
+        msg2 = str(payload.get("message") or "").strip()
+        if msg2:
+            return msg2
+    text = (response.text or "").strip()
+    return text[:400] if text else f"HTTP {response.status_code}"
+
+
+def watchlist_has_header(rows: Sequence[Sequence[object]]) -> bool:
+    if not rows:
+        return False
+    first = [parse_header_key(x) for x in rows[0]]
+    return any(
+        key in {"city", "name", "location", "zone", "place", "latitude", "lat", "longitude", "lon", "lng"}
+        for key in first
+    )
+
+
+def watchlist_find_index(header_keys: Sequence[str], candidates: Sequence[str]) -> int:
+    for idx, key in enumerate(header_keys):
+        if key in candidates:
+            return idx
+    return -1
+
+
+def extract_watchlist_location_names(rows: Sequence[Sequence[object]]) -> List[str]:
+    if not rows:
+        return []
+    parsed_rows = [[str(cell or "").strip() for cell in row] for row in rows]
+    parsed_rows = [row for row in parsed_rows if any(cell for cell in row)]
+    if not parsed_rows:
+        return []
+    has_header = watchlist_has_header(parsed_rows)
+    header_keys = [parse_header_key(x) for x in parsed_rows[0]] if has_header else []
+    start_idx = 1 if has_header else 0
+    name_idx = watchlist_find_index(header_keys, ("city", "name", "location", "zone", "place")) if has_header else 0
+    names: List[str] = []
+    seen: set[str] = set()
+    for row in parsed_rows[start_idx:]:
+        candidate = row[name_idx].strip() if 0 <= name_idx < len(row) else ""
+        if not candidate:
+            for cell in row:
+                if cell.strip():
+                    candidate = cell.strip()
+                    break
+        if not candidate:
+            continue
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(candidate)
+    return names
+
+
+def resolve_watchlist_write_token() -> str:
+    for key in (
+        "GOOGLE_SHEETS_ACCESS_TOKEN",
+        "GOOGLE_OAUTH_ACCESS_TOKEN",
+    ):
+        value = read_env_value(key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def fetch_watchlist_rows_via_token(
+    spreadsheet_id: str,
+    worksheet: str,
+    access_token: str,
+) -> List[List[str]]:
+    range_name = f"{worksheet}!A:Z"
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{quote(range_name, safe='!')}"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    if resp.status_code >= 400:
+        raise RuntimeError(parse_google_api_error(resp))
+    payload = resp.json() if resp.content else {}
+    values = payload.get("values")
+    if not isinstance(values, list):
+        return []
+    out: List[List[str]] = []
+    for row in values:
+        if isinstance(row, list):
+            out.append([str(cell or "").strip() for cell in row])
+    return out
+
+
+def append_watchlist_rows_via_token(
+    spreadsheet_id: str,
+    worksheet: str,
+    access_token: str,
+    values: List[List[str]],
+) -> None:
+    if not values:
+        return
+    range_name = f"{worksheet}!A:Z"
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{quote(range_name, safe='!')}:append"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+    params = {
+        "valueInputOption": "USER_ENTERED",
+        "insertDataOption": "INSERT_ROWS",
+    }
+    payload = {
+        "majorDimension": "ROWS",
+        "values": values,
+    }
+    resp = requests.post(url, headers=headers, params=params, json=payload, timeout=REQUEST_TIMEOUT)
+    if resp.status_code >= 400:
+        raise RuntimeError(parse_google_api_error(resp))
+
+
+def build_watchlist_append_rows(
+    city_name: str,
+    country_code: str,
+    existing_rows: Sequence[Sequence[object]],
+) -> Tuple[List[List[str]], str]:
+    now_utc = utc_now_iso()
+    city = str(city_name or "").strip()
+    country = str(country_code or "").strip().upper()[:2]
+    geocoded = geocode_location(city, country=country)
+    lat = to_float((geocoded or {}).get("lat"))
+    lon = to_float((geocoded or {}).get("lon"))
+    resolved_name = str((geocoded or {}).get("name") or city).strip() or city
+
+    rows = [[str(cell or "").strip() for cell in row] for row in existing_rows]
+    rows = [row for row in rows if any(cell for cell in row)]
+    if not rows:
+        header = ["location_order", "location", "latitude", "longitude", "enabled", "updated_at_utc"]
+        row = [
+            "1",
+            resolved_name,
+            f"{lat:.6f}" if lat is not None else "",
+            f"{lon:.6f}" if lon is not None else "",
+            "TRUE",
+            now_utc,
+        ]
+        return [header, row], resolved_name
+
+    if watchlist_has_header(rows):
+        header = rows[0]
+        header_keys = [parse_header_key(x) for x in header]
+        row = [""] * len(header)
+
+        name_idx = watchlist_find_index(header_keys, ("city", "name", "location", "zone", "place"))
+        lat_idx = watchlist_find_index(header_keys, ("latitude", "lat"))
+        lon_idx = watchlist_find_index(header_keys, ("longitude", "lon", "lng", "long"))
+        country_idx = watchlist_find_index(header_keys, ("country", "countrycode", "cc", "iso2"))
+        enabled_idx = watchlist_find_index(header_keys, ("enabled", "active", "include", "use"))
+        updated_idx = watchlist_find_index(header_keys, ("updatedatutc", "updated", "updatedat", "lastupdated"))
+        order_idx = watchlist_find_index(header_keys, ("locationorder", "order", "seq", "sequence", "id"))
+
+        if 0 <= name_idx < len(row):
+            row[name_idx] = resolved_name
+        elif row:
+            row[0] = resolved_name
+
+        if 0 <= lat_idx < len(row):
+            row[lat_idx] = f"{lat:.6f}" if lat is not None else ""
+        if 0 <= lon_idx < len(row):
+            row[lon_idx] = f"{lon:.6f}" if lon is not None else ""
+        if 0 <= country_idx < len(row):
+            row[country_idx] = country
+        if 0 <= enabled_idx < len(row):
+            row[enabled_idx] = "TRUE"
+        if 0 <= updated_idx < len(row):
+            row[updated_idx] = now_utc
+        if 0 <= order_idx < len(row):
+            max_order = 0
+            for src_row in rows[1:]:
+                if order_idx >= len(src_row):
+                    continue
+                iv = int(to_float(src_row[order_idx]) or 0)
+                if iv > max_order:
+                    max_order = iv
+            row[order_idx] = str(max_order + 1 if max_order > 0 else len(rows))
+        return [row], resolved_name
+
+    row = [
+        resolved_name,
+        f"{lat:.6f}" if lat is not None else "",
+        f"{lon:.6f}" if lon is not None else "",
+    ]
+    return [row], resolved_name
+
+
+def add_city_to_watchlist_sheet(city_name: str, country_code: str = "") -> Tuple[bool, str]:
+    city = str(city_name or "").strip()
+    if not city:
+        return False, "add-city failed: city is empty"
+    country = str(country_code or "").strip().upper()[:2]
+
+    if not country:
+        options = ambiguous_city_country_options(city)
+        if options:
+            hint = ", ".join(options[:6])
+            return (
+                False,
+                f"add-city needs country for ambiguous city '{city}'. "
+                f"Please retry with --city-country <ISO2>. Options: {hint}",
+            )
+
+    spreadsheet_id = watchlist_sheet_id()
+    worksheet = WATCHLIST_WORKSHEET
+    if not spreadsheet_id:
+        return False, "add-city failed: watchlist spreadsheet id not configured"
+
+    access_token = resolve_watchlist_write_token()
+    if not access_token:
+        return False, "add-city failed: missing GOOGLE_OAUTH_ACCESS_TOKEN/GOOGLE_SHEETS_ACCESS_TOKEN for Google Sheets write"
+
+    try:
+        rows = fetch_watchlist_rows_via_token(spreadsheet_id=spreadsheet_id, worksheet=worksheet, access_token=access_token)
+    except Exception as exc:
+        return False, f"add-city failed: unable to read watchlist sheet ({exc})"
+
+    existing_names = {name.strip().lower() for name in extract_watchlist_location_names(rows)}
+    if city.lower() in existing_names:
+        return True, f"watchlist unchanged: '{city}' already exists in sheet '{worksheet}'"
+
+    append_rows, resolved_name = build_watchlist_append_rows(city_name=city, country_code=country, existing_rows=rows)
+    try:
+        append_watchlist_rows_via_token(
+            spreadsheet_id=spreadsheet_id,
+            worksheet=worksheet,
+            access_token=access_token,
+            values=append_rows,
+        )
+    except Exception as exc:
+        return False, f"add-city failed: unable to append city to sheet ({exc})"
+
+    return True, f"watchlist updated: added '{resolved_name}' to sheet '{worksheet}'"
+
+
+def geocode_location_candidates(name: str, country: str = "", count: int = 8) -> List[Dict[str, object]]:
+    text = str(name or "").strip()
+    if not text:
+        return []
+    params = {
+        "name": text,
+        "count": max(1, min(20, int(count))),
+        "language": "en",
+        "format": "json",
+    }
+    if country:
+        params["countryCode"] = str(country).strip()[:2].upper()
+    try:
+        resp = requests.get(OPENMETEO_GEOCODING_BASE, params=params, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        payload = resp.json() if resp.content else {}
+    except Exception:
+        return []
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        return []
+    out: List[Dict[str, object]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        lat = to_float(item.get("latitude"))
+        lon = to_float(item.get("longitude"))
+        if lat is None or lon is None:
+            continue
+        out.append(
+            {
+                "name": str(item.get("name") or text).strip() or text,
+                "lat": lat,
+                "lon": lon,
+                "country": str(item.get("country") or "").strip(),
+                "country_code": str(item.get("country_code") or "").strip().upper(),
+                "admin1": str(item.get("admin1") or "").strip(),
+            }
+        )
+    return out
+
+
+def geocode_location(name: str, country: str = "") -> Optional[Dict[str, float]]:
+    candidates = geocode_location_candidates(name=name, country=country, count=1)
+    if not candidates:
+        return None
+    first = candidates[0]
+    lat = to_float(first.get("lat"))
+    lon = to_float(first.get("lon"))
+    if lat is None or lon is None:
+        return None
+    resolved_name = str(first.get("name") or str(name or "").strip()).strip() or str(name or "").strip()
+    return {"name": resolved_name, "lat": lat, "lon": lon}
+
+
+def ambiguous_city_country_options(city_name: str) -> List[str]:
+    city = str(city_name or "").strip()
+    if not city:
+        return []
+    candidates = geocode_location_candidates(name=city, country="", count=12)
+    if not candidates:
+        return []
+    target = normalize_key(city)
+    exact_matches = [c for c in candidates if normalize_key(str(c.get("name") or "")) == target]
+    if len(exact_matches) < 2:
+        return []
+
+    options: List[str] = []
+    seen: set[str] = set()
+    for item in exact_matches:
+        code = str(item.get("country_code") or "").strip().upper()
+        country = str(item.get("country") or "").strip()
+        if not code:
+            continue
+        key = code
+        if key in seen:
+            continue
+        seen.add(key)
+        label = f"{code} ({country})" if country else code
+        options.append(label)
+
+    return options if len(options) > 1 else []
+
+
+def parse_watchlist_locations(rows: Sequence[Sequence[object]]) -> List[Dict[str, float]]:
+    if not rows:
+        return []
+
+    parsed_rows = [[str(cell or "").strip() for cell in row] for row in rows]
+    parsed_rows = [row for row in parsed_rows if any(cell for cell in row)]
+    if not parsed_rows:
+        return []
+
+    header_keys = [parse_header_key(x) for x in parsed_rows[0]]
+    has_header = any(
+        key in {"city", "name", "location", "zone", "place", "latitude", "lat", "longitude", "lon", "lng"}
+        for key in header_keys
+    )
+
+    def find_index(candidates: Sequence[str]) -> int:
+        for idx, key in enumerate(header_keys):
+            if key in candidates:
+                return idx
+        return -1
+
+    start_idx = 1 if has_header else 0
+    name_idx = find_index(("city", "name", "location", "zone", "place")) if has_header else 0
+    lat_idx = find_index(("latitude", "lat")) if has_header else 1
+    lon_idx = find_index(("longitude", "lon", "lng", "long")) if has_header else 2
+    country_idx = find_index(("country", "countrycode", "cc", "iso2")) if has_header else -1
+    enabled_idx = find_index(("enabled", "active", "include", "use")) if has_header else -1
+
+    out: List[Dict[str, float]] = []
+    seen_names: set[str] = set()
+    geocode_cache: Dict[Tuple[str, str], Optional[Dict[str, float]]] = {}
+
+    for row in parsed_rows[start_idx:]:
+        if enabled_idx >= 0 and enabled_idx < len(row):
+            if not parse_bool_cell(row[enabled_idx], default=True):
+                continue
+
+        name = row[name_idx].strip() if 0 <= name_idx < len(row) else ""
+        if not name:
+            for cell in row:
+                if cell:
+                    name = cell
+                    break
+        if not name:
+            continue
+
+        lat = to_float(row[lat_idx]) if 0 <= lat_idx < len(row) else None
+        lon = to_float(row[lon_idx]) if 0 <= lon_idx < len(row) else None
+        country = row[country_idx].strip() if 0 <= country_idx < len(row) else ""
+
+        if lat is None or lon is None:
+            key = (name.lower(), country.upper())
+            if key not in geocode_cache:
+                geocode_cache[key] = geocode_location(name=name, country=country)
+            resolved = geocode_cache.get(key)
+            if not resolved:
+                continue
+            lat = to_float(resolved.get("lat"))
+            lon = to_float(resolved.get("lon"))
+            if lat is None or lon is None:
+                continue
+            if has_header and name_idx >= 0:
+                preferred_name = str(row[name_idx]).strip()
+                if preferred_name:
+                    name = preferred_name
+            else:
+                name = str(resolved.get("name") or name).strip() or name
+
+        normalized_name = name.strip()
+        if not normalized_name:
+            continue
+        key_name = normalized_name.lower()
+        if key_name in seen_names:
+            continue
+        seen_names.add(key_name)
+        out.append({"name": normalized_name, "lat": float(lat), "lon": float(lon)})
+
+    return out
+
+
+def load_locations_from_watchlist() -> List[Dict[str, float]]:
+    try:
+        rows = fetch_watchlist_rows()
+        locations = parse_watchlist_locations(rows)
+        if locations:
+            return locations
+    except Exception:
+        pass
+    return [dict(loc) for loc in DEFAULT_LOCATIONS]
 
 
 def london_today() -> dt.date:
@@ -3546,9 +4105,31 @@ def build_compact_briefing(
 
 
 def main() -> None:
+    global LOCATIONS
     args = parse_args()
     mode = "compact" if args.compact else args.mode
 
+    if str(args.add_city or "").strip():
+        ok, message = add_city_to_watchlist_sheet(
+            city_name=str(args.add_city).strip(),
+            country_code=str(args.city_country or "").strip(),
+        )
+        print(message)
+        update_heartbeat_state(
+            "weather_watchlist_update",
+            "ok" if ok else "failed",
+            {
+                "city": str(args.add_city).strip(),
+                "country": str(args.city_country or "").strip().upper(),
+                "ok": bool(ok),
+                "message": message,
+            },
+        )
+        if not ok:
+            raise SystemExit(1)
+        return
+
+    LOCATIONS = load_locations_from_watchlist()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     RUNTIME_SOURCE_NOTES.clear()
 
