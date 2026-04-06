@@ -38,6 +38,8 @@ from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 import requests
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 DEFAULT_LOCATIONS = [
     {"name": "Glencoe", "lat": 56.68, "lon": -5.10},
@@ -45,6 +47,10 @@ DEFAULT_LOCATIONS = [
     {"name": "Glenshee", "lat": 56.8526, "lon": -3.4258},
     {"name": "Cairngorms", "lat": 57.1, "lon": -3.7},
 ]
+DEFAULT_LOCATION_MAP = {
+    str(loc["name"]).strip().lower(): dict(loc)
+    for loc in DEFAULT_LOCATIONS
+}
 LOCATIONS = [dict(loc) for loc in DEFAULT_LOCATIONS]
 
 TZ = ZoneInfo("Europe/London")
@@ -233,6 +239,7 @@ OPENWEATHER_API_KEY = read_env_value("OPENWEATHER_API_KEY", "")
 OPENWEATHER_MODE = read_env_value("OPENWEATHER_MODE", "auto").strip().lower() or "auto"
 
 # Google Weather API daily forecast endpoint.
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_WEATHER_BASE = "https://weather.googleapis.com/v1/forecast/days:lookup"
 GOOGLE_WEATHER_API_KEY = read_env_value("GOOGLE_WEATHER_API_KEY", "")
 GOOGLE_WEATHER_ACCESS_TOKEN = read_env_value("GOOGLE_WEATHER_ACCESS_TOKEN", "")
@@ -285,6 +292,7 @@ WEATHER_SITE_GIT_BRANCH = read_env_value("WEATHER_SITE_GIT_BRANCH", "main").stri
 WEATHER_SITE_DATA_SUBDIR = read_env_value("WEATHER_SITE_DATA_SUBDIR", "public/data").strip().strip("/") or "public/data"
 WEATHER_SITE_HISTORY_DAYS = max(7, read_int_env("WEATHER_SITE_HISTORY_DAYS", 30))
 WEATHER_SITE_GIT_PUSH_ENABLED = read_bool_env("WEATHER_SITE_GIT_PUSH_ENABLED", True)
+SERVICE_ACCOUNT_TOKEN_CACHE: Dict[str, Tuple[str, float]] = {}
 
 
 def extract_google_sheet_id(sheet_url: str) -> str:
@@ -310,6 +318,140 @@ def parse_header_key(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
 
 
+def jwt_b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def load_service_account_payload(prefixes: Iterable[str]) -> Dict[str, str]:
+    candidates = [str(p or "").strip().upper() for p in prefixes if str(p or "").strip()]
+    json_keys: List[str] = []
+    file_keys: List[str] = []
+    email_keys: List[str] = []
+    private_key_keys: List[str] = []
+    for prefix in candidates:
+        json_keys.extend([f"{prefix}_SERVICE_ACCOUNT_JSON", f"{prefix}_JSON"])
+        file_keys.extend([f"{prefix}_SERVICE_ACCOUNT_JSON_FILE", f"{prefix}_JSON_FILE"])
+        email_keys.extend([f"{prefix}_SERVICE_ACCOUNT_EMAIL", f"{prefix}_CLIENT_EMAIL", "GOOGLE_CLIENT_EMAIL"])
+        private_key_keys.extend([f"{prefix}_SERVICE_ACCOUNT_PRIVATE_KEY", f"{prefix}_PRIVATE_KEY", "GOOGLE_PRIVATE_KEY"])
+
+    json_keys.extend(["GOOGLE_SERVICE_ACCOUNT_JSON", "GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON"])
+    file_keys.extend(["GOOGLE_SERVICE_ACCOUNT_JSON_FILE", "GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON_FILE"])
+    email_keys.extend(["GOOGLE_SERVICE_ACCOUNT_EMAIL", "GOOGLE_SHEETS_SERVICE_ACCOUNT_EMAIL"])
+    private_key_keys.extend(["GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY", "GOOGLE_SHEETS_SERVICE_ACCOUNT_PRIVATE_KEY"])
+
+    raw_json = ""
+    for key in json_keys:
+        raw_json = read_env_value(key, "").strip()
+        if raw_json:
+            break
+    if not raw_json:
+        for key in file_keys:
+            path_text = read_env_value(key, "").strip()
+            if not path_text:
+                continue
+            try:
+                raw_json = Path(path_text).read_text(encoding="utf-8")
+                break
+            except Exception:
+                continue
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+        except Exception:
+            parsed = {}
+        if isinstance(parsed, dict):
+            client_email = str(parsed.get("client_email", "")).strip()
+            private_key = str(parsed.get("private_key", "")).strip()
+            token_uri = str(parsed.get("token_uri", "")).strip() or GOOGLE_TOKEN_URL
+            project_id = str(parsed.get("project_id", "")).strip()
+            if client_email and private_key:
+                return {
+                    "client_email": client_email,
+                    "private_key": private_key,
+                    "token_uri": token_uri,
+                    "project_id": project_id,
+                }
+
+    client_email = ""
+    for key in email_keys:
+        client_email = read_env_value(key, "").strip()
+        if client_email:
+            break
+    private_key = ""
+    for key in private_key_keys:
+        private_key = read_env_value(key, "").strip()
+        if private_key:
+            break
+    private_key = private_key.replace("\\n", "\n").strip()
+    token_uri = read_env_value("GOOGLE_SERVICE_ACCOUNT_TOKEN_URI", GOOGLE_TOKEN_URL).strip() or GOOGLE_TOKEN_URL
+    project_id = read_env_value("GOOGLE_SERVICE_ACCOUNT_PROJECT_ID", "").strip()
+    if client_email and private_key:
+        return {
+            "client_email": client_email,
+            "private_key": private_key,
+            "token_uri": token_uri,
+            "project_id": project_id,
+        }
+    return {}
+
+
+def mint_service_account_access_token(prefixes: Iterable[str], scopes: Iterable[str]) -> Tuple[str, str]:
+    payload = load_service_account_payload(prefixes)
+    client_email = str(payload.get("client_email", "")).strip()
+    private_key_pem = str(payload.get("private_key", "")).strip()
+    token_uri = str(payload.get("token_uri", "")).strip() or GOOGLE_TOKEN_URL
+    scope_list = [str(s or "").strip() for s in scopes if str(s or "").strip()]
+    if not client_email or not private_key_pem or not scope_list:
+        return "", "service account credentials not configured"
+
+    cache_key = f"{client_email}|{' '.join(scope_list)}"
+    cached = SERVICE_ACCOUNT_TOKEN_CACHE.get(cache_key)
+    now_ts = dt.datetime.now(dt.timezone.utc).timestamp()
+    if cached and cached[0] and cached[1] > now_ts + 60:
+        return cached[0], ""
+
+    try:
+        private_key = serialization.load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
+    except Exception as exc:
+        return "", f"service account private key load failed ({exc.__class__.__name__}: {exc})"
+
+    issued_at = int(now_ts)
+    claim = {
+        "iss": client_email,
+        "scope": " ".join(scope_list),
+        "aud": token_uri,
+        "iat": issued_at,
+        "exp": issued_at + 3600,
+    }
+    header = {"alg": "RS256", "typ": "JWT"}
+    encoded_header = jwt_b64url(json.dumps(header, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+    encoded_claim = jwt_b64url(json.dumps(claim, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+    signing_input = f"{encoded_header}.{encoded_claim}".encode("ascii")
+    try:
+        signature = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    except Exception as exc:
+        return "", f"service account signing failed ({exc.__class__.__name__}: {exc})"
+    assertion = f"{encoded_header}.{encoded_claim}.{jwt_b64url(signature)}"
+
+    token_payload = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "assertion": assertion,
+    }
+    try:
+        resp = requests.post(token_uri, data=token_payload, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        return "", f"service account token mint failed ({exc.__class__.__name__}: {exc})"
+
+    access_token = str(data.get("access_token", "")).strip()
+    expires_in = int(data.get("expires_in", 3600) or 3600)
+    if not access_token:
+        return "", "service account token response missing access_token"
+    SERVICE_ACCOUNT_TOKEN_CACHE[cache_key] = (access_token, now_ts + max(300, expires_in))
+    return access_token, ""
+
+
 def watchlist_sheet_id() -> str:
     explicit = WATCHLIST_SPREADSHEET_ID.strip()
     if explicit:
@@ -333,15 +475,20 @@ def parse_watchlist_csv_rows(text: str) -> List[List[str]]:
 def fetch_watchlist_rows_from_sheets_api(spreadsheet_id: str, worksheet: str) -> List[List[str]]:
     if not spreadsheet_id:
         return []
-    if not GOOGLE_SHEETS_API_KEY and not GOOGLE_SHEETS_ACCESS_TOKEN:
+    service_token, _service_err = mint_service_account_access_token(
+        prefixes=("GOOGLE_SHEETS", "GOOGLE"),
+        scopes=("https://www.googleapis.com/auth/spreadsheets",),
+    )
+    access_token = service_token or GOOGLE_SHEETS_ACCESS_TOKEN
+    if not GOOGLE_SHEETS_API_KEY and not access_token:
         return []
 
     range_name = f"{worksheet}!A:Z"
     url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{quote(range_name, safe='!')}"
     headers: Dict[str, str] = {}
     params: Dict[str, str] = {}
-    if GOOGLE_SHEETS_ACCESS_TOKEN:
-        headers["Authorization"] = f"Bearer {GOOGLE_SHEETS_ACCESS_TOKEN}"
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
     if GOOGLE_SHEETS_API_KEY:
         params["key"] = GOOGLE_SHEETS_API_KEY
     resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
@@ -455,6 +602,12 @@ def extract_watchlist_location_names(rows: Sequence[Sequence[object]]) -> List[s
 
 
 def resolve_watchlist_write_token() -> str:
+    service_token, _service_err = mint_service_account_access_token(
+        prefixes=("GOOGLE_SHEETS", "GOOGLE"),
+        scopes=("https://www.googleapis.com/auth/spreadsheets",),
+    )
+    if service_token:
+        return service_token
     for key in (
         "GOOGLE_SHEETS_ACCESS_TOKEN",
         "GOOGLE_OAUTH_ACCESS_TOKEN",
@@ -757,23 +910,31 @@ def parse_watchlist_locations(rows: Sequence[Sequence[object]]) -> List[Dict[str
             if not parse_bool_cell(row[enabled_idx], default=True):
                 continue
 
-        name = row[name_idx].strip() if 0 <= name_idx < len(row) else ""
-        if not name:
+        raw_name = row[name_idx].strip() if 0 <= name_idx < len(row) else ""
+        if not raw_name:
             for cell in row:
                 if cell:
-                    name = cell
+                    raw_name = cell
                     break
-        if not name:
+        normalized_name = str(raw_name or "").strip()
+        if not normalized_name:
             continue
+        key_name = normalized_name.lower()
 
         lat = to_float(row[lat_idx]) if 0 <= lat_idx < len(row) else None
         lon = to_float(row[lon_idx]) if 0 <= lon_idx < len(row) else None
         country = row[country_idx].strip() if 0 <= country_idx < len(row) else ""
 
+        default_match = DEFAULT_LOCATION_MAP.get(key_name)
+        if (lat is None or lon is None) and default_match:
+            lat = default_match["lat"]
+            lon = default_match["lon"]
+            normalized_name = default_match["name"]
+
         if lat is None or lon is None:
-            key = (name.lower(), country.upper())
+            key = (normalized_name.lower(), country.upper())
             if key not in geocode_cache:
-                geocode_cache[key] = geocode_location(name=name, country=country)
+                geocode_cache[key] = geocode_location(name=normalized_name, country=country)
             resolved = geocode_cache.get(key)
             if not resolved:
                 continue
@@ -784,14 +945,16 @@ def parse_watchlist_locations(rows: Sequence[Sequence[object]]) -> List[Dict[str
             if has_header and name_idx >= 0:
                 preferred_name = str(row[name_idx]).strip()
                 if preferred_name:
-                    name = preferred_name
+                    normalized_name = preferred_name
             else:
-                name = str(resolved.get("name") or name).strip() or name
+                normalized_name = str(resolved.get("name") or normalized_name).strip() or normalized_name
+            key_name = normalized_name.lower()
+            default_match = DEFAULT_LOCATION_MAP.get(key_name)
+            if default_match:
+                lat = default_match["lat"]
+                lon = default_match["lon"]
+                normalized_name = default_match["name"]
 
-        normalized_name = name.strip()
-        if not normalized_name:
-            continue
-        key_name = normalized_name.lower()
         if key_name in seen_names:
             continue
         seen_names.add(key_name)
